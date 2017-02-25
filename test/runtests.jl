@@ -1,5 +1,5 @@
 using ClangSA
-using Base.Test
 
-# write your own tests here
-@test 1 == 2
+database = ClangSA.createFixedCompileDatabase(".",
+  ["cc", string("-I", joinpath(JULIA_HOME,"../include/julia"))])
+ClangSA.runTool(database, ["GCPushPop.cpp"], ClangSA.getAnalysisAction(), verify = true)

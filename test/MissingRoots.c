@@ -75,3 +75,41 @@ jl_value_t *already_freed() {
                                           // expected-note@-1{{warning: Argument value may have been GCed}}
     return ret;
 };
+
+int field_access() {
+    jl_svec_t *val = jl_svec1(NULL); 
+    jl_gc_safepoint(); // expected-note{{Value may have been GCed here}}
+    return val->length == 1; // expected-warning{{Trying to access value which may have been GCed}}
+                             // expected-note@-1{{Trying to access value which may have been GCed}}
+}  
+
+int pushargs_roots() {
+  jl_value_t **margs;
+  jl_svec_t *val = jl_svec1(NULL);;
+  JL_GC_PUSHARGS(margs, 2);
+  margs[1] = val;
+  jl_gc_safepoint();
+  JL_GC_POP();
+  return val->length == 1;
+}
+
+int pushargs_roots_freed() {
+  jl_value_t **margs;
+  jl_svec_t *val = jl_svec1(NULL);;
+  JL_GC_PUSHARGS(margs, 1);
+  margs[0] = val; // expected-note{{Value was rooted here}}
+  JL_GC_POP(); // expected-noted{{Root was released here}}
+  jl_gc_safepoint(); // expected-note{{Value may have been GCed here}}
+  return val->length == 1; // expected-warning{{Trying to access value which may have been GCed}}
+                           // expected-note@-1{{Trying to access value which may have been GCed}}
+}
+
+extern void process_unrooted(jl_value_t *maybe_unrooted MAYBE_UNROOTED);
+int unrooted() {
+  jl_svec_t *val = jl_svec1(NULL);
+  // This is ok
+  process_unrooted(val); // expected-note{{Value may have been GCed here}}
+  // This is not
+  return val->length == 1; // expected-warning{{Trying to access value which may have been GCed}}
+                           // expected-note@-1{{Trying to access value which may have been GCed}}
+}

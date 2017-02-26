@@ -6,11 +6,12 @@ namespace {
                                             check::EndFunction,
                                             check::PostCall,
                                             check::PreCall,
-                                            check::Bind
+                                            check::Bind,
+                                            check::Location
                                             > {
         mutable std::unique_ptr<BugType> BT;
         void report_error(CheckerContext &C, const char *message) const;
-        void report_value_error(CheckerContext &C, SymbolRef Sym, const char *message) const;
+        void report_value_error(CheckerContext &C, SymbolRef Sym, const char *message, clang::SourceRange range = clang::SourceRange()) const;
     
     public:
         struct ValueState {
@@ -20,6 +21,9 @@ namespace {
             
             bool operator==(const ValueState &VS) const {
                 return S == VS.S && Root == VS.Root;
+            }
+            bool operator!=(const ValueState &VS) const {
+                return S != VS.S || Root != VS.Root;
             }
             
             void Profile(llvm::FoldingSetNodeID &ID) const {
@@ -39,29 +43,35 @@ namespace {
         };
         
         struct RootState {
-            enum State { Root } S;
+            enum Kind { Root, RootArray } K;
             unsigned RootedAtDepth;
             
-            RootState(State InS, unsigned Depth) : S(InS), RootedAtDepth(Depth) {}
+            RootState(Kind InK, unsigned Depth) : K(InK), RootedAtDepth(Depth) {}
             
             bool operator==(const RootState &VS) const {
-                return S == VS.S && RootedAtDepth == VS.RootedAtDepth;
+                return K == VS.K && RootedAtDepth == VS.RootedAtDepth;
+            }
+            bool operator!=(const RootState &VS) const {
+                return K != VS.K || RootedAtDepth != VS.RootedAtDepth;
             }
             
             bool shouldPopAtDepth(unsigned Depth) const { return Depth == RootedAtDepth; }
+            bool isRootArray() const { return K == RootArray; }
             
             void Profile(llvm::FoldingSetNodeID &ID) const {
-                ID.AddInteger(S);
+                ID.AddInteger(K);
                 ID.AddInteger(RootedAtDepth);
             }
             
             static RootState getRoot(unsigned Depth) { return RootState(Root, Depth); }
+            static RootState getRootArray(unsigned Depth) { return RootState(RootArray, Depth); }
         };
         
     private:
         bool isGCTrackedTypeName(StringRef Name) const;
         bool isGCTrackedType(QualType Type) const;
         static void dumpState(const ProgramStateRef &State);
+        static bool declHasAnnotation(const clang::Decl *D, const char *which);
         bool isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) const;
         bool isSafepoint(const CallEvent &Call) const;
         bool processPotentialSafepoint(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
@@ -73,6 +83,7 @@ namespace {
         void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
         void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
         void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
+        void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &) const;
         class GCBugVisitor
           : public BugReporterVisitorImpl<GCBugVisitor> {
         public:
@@ -136,11 +147,21 @@ clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCValueBugVisitor::VisitNode
   BugReporterContext &BRC, BugReport &BR) {
     const ValueState *NewValueState = N->getState()->get<GCValueMap>(Sym);
     const ValueState *OldValueState = PrevN->getState()->get<GCValueMap>(Sym);
-    if (!NewValueState || !OldValueState)
+    const Stmt *Stmt = PathDiagnosticLocation::getStmt(N);
+    
+    PathDiagnosticLocation Pos;
+    if (Stmt)
+      Pos = PathDiagnosticLocation{Stmt,
+                           BRC.getSourceManager(),
+                           N->getLocationContext()};
+    else
+      Pos = PathDiagnosticLocation::createDeclEnd(N->getLocationContext(),
+                                                  BRC.getSourceManager());
+    if (!NewValueState)
       return nullptr;
-    PathDiagnosticLocation Pos(PathDiagnosticLocation::getStmt(N),
-                         BRC.getSourceManager(),
-                         N->getLocationContext());
+    if (!OldValueState) {
+      return new PathDiagnosticEventPiece(Pos, "Started tracking value here.");
+    }
     if (NewValueState->isPotentiallyFreed() &&
         OldValueState->isJustAllocated()) {
       // std::make_shared< in later LLVM
@@ -170,7 +191,7 @@ void GCPushPopChecker::report_error(CheckerContext &C, const char *message) cons
     C.emitReport(std::move(Report));
 }
 
-void GCPushPopChecker::report_value_error(CheckerContext &C, SymbolRef Sym, const char *message) const
+void GCPushPopChecker::report_value_error(CheckerContext &C, SymbolRef Sym, const char *message, SourceRange range) const
 {
     // Generate an error node.
     ExplodedNode *N = C.generateErrorNode();
@@ -182,6 +203,9 @@ void GCPushPopChecker::report_value_error(CheckerContext &C, SymbolRef Sym, cons
                            categories::LogicError));
     auto Report = llvm::make_unique<BugReport>(*BT, message, N);
     Report->addVisitor(llvm::make_unique<GCValueBugVisitor>(Sym));
+    if (!range.isInvalid()) {
+        Report->addRange(range);
+    }
     C.emitReport(std::move(Report));
 }
 
@@ -193,17 +217,23 @@ void GCPushPopChecker::checkEndFunction(CheckerContext &C) const {
     }
 }
 
+bool GCPushPopChecker::declHasAnnotation(const clang::Decl *D, const char *which) {
+  for (const auto *Ann : D->specific_attrs<AnnotateAttr>()) {
+      if (Ann->getAnnotation() == which)
+          return true;
+  }
+  return false;
+}
+
 bool GCPushPopChecker::isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) const {
-    for (const auto *Ann : FD->specific_attrs<AnnotateAttr>()) {
-        if (Ann->getAnnotation() == "julia_not_safepoint")
-            return true;
-    }
-    return false;
+    return declHasAnnotation(FD, "julia_not_safepoint");
 }
 
 bool GCPushPopChecker::isGCTrackedTypeName(StringRef Name) const {
     if (Name.endswith_lower("jl_value_t") ||
-        Name.endswith_lower("jl_svec_t")) {
+        Name.endswith_lower("jl_svec_t") ||
+        Name.endswith_lower("jl_sym_t") ||
+        Name.endswith_lower("jl_expr_t")) {
         return true;
     }
     return false;
@@ -227,9 +257,21 @@ bool GCPushPopChecker::isGCTrackedType(QualType QT) const {
 bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
 {
   bool isCalleeSafepoint = true;
-  const FunctionDecl *FD = Call.getDecl()->getAsFunction();
-  if (FD) {
-      isCalleeSafepoint = !isFDAnnotatedNotSafepoint(FD);
+  if (Call.isGlobalCFunction("malloc")) {
+    isCalleeSafepoint = false;
+  } else {
+    auto *Decl = Call.getDecl();
+    const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
+    if (FD) {
+      switch (FD->getBuiltinID()) {
+        default:
+          isCalleeSafepoint = !isFDAnnotatedNotSafepoint(FD);
+          break;
+          
+        case Builtin::BI__builtin_alloca:
+          isCalleeSafepoint = false;
+      }
+    }
   }
   return isCalleeSafepoint;
 }
@@ -255,7 +297,10 @@ bool GCPushPopChecker::processAllocationOfResult(const CallEvent &Call, CheckerC
   QualType QT = Call.getResultType();
   if (!isGCTrackedType(QT))
       return false;
-  State = State->set<GCValueMap>(Call.getReturnValue().getAsSymbol(), ValueState::getAllocated());
+  SymbolRef Sym = Call.getReturnValue().getAsSymbol();
+  if (!Sym)
+      return false;
+  State = State->set<GCValueMap>(Sym, ValueState::getAllocated());
   return true;
 }
 
@@ -280,17 +325,31 @@ void GCPushPopChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) co
     unsigned NumArgs = Call.getNumArgs();
     ProgramStateRef State = C.getState();
     bool isCalleeSafepoint = isSafepoint(Call);
+    auto *Decl = Call.getDecl();
+    const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
     for (unsigned idx = 0; idx < NumArgs; ++idx) {
         SVal Arg = Call.getArgSVal(idx);
-        auto *ValState = State->get<GCValueMap>(Arg.getAsSymbol());
+        SymbolRef Sym = Arg.getAsSymbol();
+        if (!Sym)
+            continue;
+        auto *ValState = State->get<GCValueMap>(Sym);
         if (!ValState)
             continue;
+        if (ValState->isPotentiallyFreed())
+            report_value_error(C, Sym, "Argument value may have been GCed");
         if (ValState->isRooted())
             continue;
-        if (isCalleeSafepoint)
-            report_error(C, "Passing non-rooted value as argument to function that may GC");
-        else if (ValState->isPotentiallyFreed())
-            report_value_error(C, Arg.getAsSymbol(), "Argument value may have been GCed");
+        bool MaybeUnrooted = false;
+        if (FD) {
+            MaybeUnrooted = declHasAnnotation(FD->getParamDecl(idx), "julia_maybe_unrooted");
+        }
+        if (!MaybeUnrooted && isCalleeSafepoint) {
+            SValExplainer Ex(C.getASTContext());
+            SourceRange range;
+            if (const Expr *E = Call.getArgExpr(idx))
+                range = E->getSourceRange();
+            report_value_error(C, Sym, "Passing non-rooted value as argument to function that may GC", range);
+        }
     }
 }
 
@@ -339,27 +398,55 @@ bool GCPushPopChecker::evalCall(const CallExpr *CE,
         for (unsigned i = 0; i < NumArgs; ++i) {
             SVal V = C.getSVal(CE->getArg(i));
             auto MRV = V.getAs<loc::MemRegionVal>();
-            if (!MRV)
+            if (!MRV) {
                 report_error(C, "JL_GC_PUSH with something other than a local variable");
+                return true;
+            }
             const MemRegion *Region = MRV->getRegion();
             State = State->set<GCRootMap>(Region, RootState::getRoot(CurrentDepth));
             // Now for the value
             SVal Value = State->getSVal(Region);
-            const ValueState *ValState = State->get<GCValueMap>(Value.getAsSymbol());
+            SymbolRef Sym = Value.getAsSymbol();
+            if (!Sym)
+              continue;
+            const ValueState *ValState = State->get<GCValueMap>(Sym);
             if (!ValState)
               continue;
             if (ValState->isPotentiallyFreed())
-              report_value_error(C, Value.getAsSymbol(), "Trying to root value which may have been GCed");
-            State = State->set<GCValueMap>(Value.getAsSymbol(), ValueState::getRooted(Region));
+              report_value_error(C, Sym, "Trying to root value which may have been GCed");
+            State = State->set<GCValueMap>(Sym, ValueState::getRooted(Region));
         }
         CurrentDepth += 1;
         State = State->set<GCDepth>(CurrentDepth);
         C.addTransition(State); 
         return true;
-    } else if (name == "_JL_GC_PUSHARGS" ||
-        name == "jl_gc_push_arraylist") {
+    } else if (name == "_JL_GC_PUSHARGS") {
+        ProgramStateRef State = C.getState();
+        SVal ArgArray = C.getSVal(CE->getArg(0));
+        auto MRV = ArgArray.getAs<loc::MemRegionVal>();
+        if (!MRV) {
+            report_error(C, "JL_GC_PUSH with something other than an args array");
+            return true;
+        }
+        const MemRegion *Region = MRV->getRegion()->StripCasts();
+        SValExplainer Ex(C.getASTContext());
+        State = State->set<GCRootMap>(Region, RootState::getRootArray(CurrentDepth));
+        CurrentDepth += 1;
+        State = State->set<GCDepth>(CurrentDepth);
+        C.addTransition(State);
+        return true; 
+    } else if (name == "jl_gc_push_arraylist") {
         CurrentDepth += 1;
         C.addTransition(C.getState()->set<GCDepth>(CurrentDepth));
+        return true;
+    } else if (name == "jl_ast_preserve") {
+        // TODO: Maybe bind the rooting to the context. For now, the second
+        //       argument gets unconditionally rooted
+        ProgramStateRef State = C.getState();
+        SymbolRef Sym = C.getSVal(CE->getArg(1)).getAsSymbol();
+        if (!Sym)
+          return true;
+        C.addTransition(State->set<GCValueMap>(Sym, ValueState::getRooted(nullptr)));
         return true;
     }
     return false;
@@ -368,19 +455,50 @@ bool GCPushPopChecker::evalCall(const CallExpr *CE,
 void GCPushPopChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, CheckerContext &C) const {
     auto State = C.getState();
     const MemRegion *R = LVal.getAsRegion();
+    SValExplainer Ex(C.getASTContext());
     if (!R)
         return;
+    bool shouldBeRootArray = false;
+    const ElementRegion *ER = R->getAs<ElementRegion>();
+    if (ER) {
+        R = R->getBaseRegion()->StripCasts();
+        shouldBeRootArray = true;
+    } 
     const auto *RootState = State->get<GCRootMap>(R);
     if (!RootState)
         return;
+    if (shouldBeRootArray && !RootState->isRootArray()) {
+        report_error(C, "This assignment looks weird. Expected a root array on the LHS.");
+        return;
+    }
     SymbolRef Sym = RVal.getAsSymbol();
     const auto *RValState = State->get<GCValueMap>(Sym);
-    if (!RValState)
+    if (!RValState) {
         report_error(C, "Saw assignment to root, but missed the allocation");
+        return;
+    }
     if (RValState->isPotentiallyFreed())
         report_value_error(C, Sym, "Trying to root value which may have been GCed");
     C.addTransition(State->set<GCValueMap>(Sym, ValueState::getRooted(R)));
 }
+
+void GCPushPopChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+    // If it's just the symbol by itself, let it be. We allow dead pointer to be
+    // passed around, so long as they're not accessed.
+    if (Loc.getAsSymbol(false))
+      return;
+    // This will walk backwards until it finds the base symbol
+    SymbolRef Sym = Loc.getAsSymbol(true);
+    if (!Sym)
+      return;
+    const ValueState *VState = C.getState()->get<GCValueMap>(Sym);
+    if (!VState)
+      return;
+    if (VState->isPotentiallyFreed()) {
+      report_value_error(C, Sym, "Trying to access value which may have been GCed");
+    }
+}
+
 
 void registerGcPushPopChecker(CheckerManager &mgr) {
     mgr.registerChecker<GCPushPopChecker>();

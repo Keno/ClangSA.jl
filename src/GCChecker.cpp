@@ -3,9 +3,11 @@ namespace {
     using namespace ento;
   
     class GCPushPopChecker : public Checker<eval::Call,
+                                            check::BeginFunction,
                                             check::EndFunction,
                                             check::PostCall,
                                             check::PreCall,
+                                            check::PostStmt<CStyleCastExpr>,
                                             check::Bind,
                                             check::Location
                                             > {
@@ -68,20 +70,39 @@ namespace {
         };
         
     private:
-        bool isGCTrackedTypeName(StringRef Name) const;
+        template <typename callback>
+        static bool isJuliaType(callback f, QualType QT) {
+          if (!QT->isPointerType())
+              return false;
+          QT = QT->getPointeeType();
+          const TypedefType *TT = QT->getAs<TypedefType>();
+          if (TT) {
+              if (f(TT->getDecl()->getName()))
+                  return true;
+          }
+          const TagDecl *TD = QT->getUnqualifiedDesugaredType()->getAsTagDecl();
+          if (!TD) {
+              return false;
+          }
+          return f(TD->getName());
+        }
         bool isGCTrackedType(QualType Type) const;
+        bool isGloballyRootedType(QualType Type) const;
         static void dumpState(const ProgramStateRef &State);
         static bool declHasAnnotation(const clang::Decl *D, const char *which);
         bool isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) const;
         bool isSafepoint(const CallEvent &Call) const;
         bool processPotentialSafepoint(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
         bool processAllocationOfResult(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
+        bool rootIfGlobal(SymbolRef SymByItself, CheckerContext &C) const;
         
     public:
+        void checkBeginFunction(CheckerContext &Ctx) const;
         void checkEndFunction(CheckerContext &Ctx) const;
         bool evalCall(const CallExpr *CE, CheckerContext &C) const;
         void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
         void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+        void checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C) const;
         void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
         void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &) const;
         class GCBugVisitor
@@ -209,6 +230,34 @@ void GCPushPopChecker::report_value_error(CheckerContext &C, SymbolRef Sym, cons
     C.emitReport(std::move(Report));
 }
 
+// Consider argument values rooted, unless an annotation says otherwise
+void GCPushPopChecker::checkBeginFunction(CheckerContext &C) const {
+    if (!C.inTopFrame())
+        return;
+    const auto *LCtx = C.getLocationContext();
+    const auto *FD = dyn_cast<FunctionDecl>(LCtx->getDecl());
+    if (!FD)
+        return;
+    bool Change = false;
+    bool isFunctionSafePoint = !isFDAnnotatedNotSafepoint(FD);
+    ProgramStateRef State = C.getState();
+    SValExplainer EX(C.getASTContext());
+    for (const auto P : FD->parameters()) {
+        if (isGCTrackedType(P->getType())) {
+            auto Param = State->getLValue(P, LCtx);
+            SymbolRef Sym = State->getSVal(Param).getAsSymbol();
+            if (isFunctionSafePoint)
+                State = State->set<GCValueMap>(Sym, ValueState::getRooted(nullptr));            
+            else
+                State = State->set<GCValueMap>(Sym, ValueState::getAllocated());
+            Change = true;
+        }
+    }
+    if (Change) {
+        C.addTransition(State);
+    }
+}
+
 void GCPushPopChecker::checkEndFunction(CheckerContext &C) const {
     if (!C.inTopFrame())
         return;
@@ -229,29 +278,24 @@ bool GCPushPopChecker::isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) 
     return declHasAnnotation(FD, "julia_not_safepoint");
 }
 
-bool GCPushPopChecker::isGCTrackedTypeName(StringRef Name) const {
-    if (Name.endswith_lower("jl_value_t") ||
-        Name.endswith_lower("jl_svec_t") ||
-        Name.endswith_lower("jl_sym_t") ||
-        Name.endswith_lower("jl_expr_t")) {
-        return true;
-    }
-    return false;
+bool GCPushPopChecker::isGCTrackedType(QualType QT) const {
+    return isJuliaType([](StringRef Name) {
+      if (Name.endswith_lower("jl_value_t") ||
+          Name.endswith_lower("jl_svec_t") ||
+          Name.endswith_lower("jl_sym_t") ||
+          Name.endswith_lower("jl_expr_t") ||
+          Name.endswith_lower("jl_code_info_t") ||
+          Name.endswith_lower("jl_array_t")) {
+          return true;
+      }
+      return false; 
+    }, QT);
 }
 
-bool GCPushPopChecker::isGCTrackedType(QualType QT) const {
-    if (!QT->isPointerType())
-        return false;
-    QT = QT->getPointeeType();
-    const TypedefType *TT = QT->getAs<TypedefType>();
-    if (TT) {
-        if (isGCTrackedTypeName(TT->getDecl()->getName()))
-            return true;
-    }
-    const TagDecl *TD = QT->getUnqualifiedDesugaredType()->getAsTagDecl();
-    if (!TD)
-        return false;
-    return isGCTrackedTypeName(TD->getName());
+bool GCPushPopChecker::isGloballyRootedType(QualType QT) const {
+    return isJuliaType([](StringRef Name) {
+      return Name.endswith_lower("jl_sym_t");
+    }, QT);
 }
 
 bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
@@ -267,7 +311,8 @@ bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
         default:
           isCalleeSafepoint = !isFDAnnotatedNotSafepoint(FD);
           break;
-          
+
+        case Builtin::BI__builtin_expect:
         case Builtin::BI__builtin_alloca:
           isCalleeSafepoint = false;
       }
@@ -298,9 +343,44 @@ bool GCPushPopChecker::processAllocationOfResult(const CallEvent &Call, CheckerC
   if (!isGCTrackedType(QT))
       return false;
   SymbolRef Sym = Call.getReturnValue().getAsSymbol();
+  SValExplainer Ex(C.getASTContext());
   if (!Sym)
       return false;
-  State = State->set<GCValueMap>(Sym, ValueState::getAllocated());
+  if (isGloballyRootedType(QT))
+      State = State->set<GCValueMap>(Sym, ValueState::getRooted(nullptr));
+  else {
+      ValueState NewVState = ValueState::getAllocated();
+      auto *Decl = Call.getDecl();
+      const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
+      if (FD) {
+          for (int i = 0; i < FD->getNumParams(); ++i) {
+              if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
+                  // Walk backwards to find the region that roots this value
+                  const MemRegion *Region = Call.getArgSVal(i).getAsRegion();
+                  if (!Region)
+                    break;
+                  while (true) {
+                      const SymbolicRegion *SR = Region->getSymbolicBase();
+                      if (!SR) {
+                        break;
+                      }
+                      SymbolRef Sym = SR->getSymbol();
+                      const ValueState *OldVState = State->get<GCValueMap>(Sym);
+                      if (!OldVState || !OldVState->isRooted()) {
+                          if (const SymbolRegionValue *SRV = dyn_cast<SymbolRegionValue>(Sym)) {
+                              Region = SRV->getRegion();
+                              continue;
+                          }
+                          break;
+                      }
+                      NewVState = *OldVState;
+                      break;                      
+                  }
+              }
+          }
+      }
+      State = State->set<GCValueMap>(Sym, NewVState);
+  }
   return true;
 }
 
@@ -310,6 +390,16 @@ void GCPushPopChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) c
   didChange |= processAllocationOfResult(Call, C, State);
   if (didChange)
     C.addTransition(State);
+}
+
+// Implicitly root values that were casted to globally rooted values
+void GCPushPopChecker::checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C) const {
+    if (!isGloballyRootedType(CE->getTypeAsWritten()))
+        return;
+    SymbolRef Sym = C.getSVal(CE).getAsSymbol();
+    if (!Sym)
+        return;
+    C.addTransition(C.getState()->set<GCValueMap>(Sym, ValueState::getRooted(nullptr)));
 }
 
 void GCPushPopChecker::dumpState(const ProgramStateRef &State) {
@@ -474,6 +564,8 @@ void GCPushPopChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, Che
     SymbolRef Sym = RVal.getAsSymbol();
     const auto *RValState = State->get<GCValueMap>(Sym);
     if (!RValState) {
+        if (rootIfGlobal(Sym, C))
+            return;
         report_error(C, "Saw assignment to root, but missed the allocation");
         return;
     }
@@ -482,11 +574,38 @@ void GCPushPopChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, Che
     C.addTransition(State->set<GCValueMap>(Sym, ValueState::getRooted(R)));
 }
 
+bool GCPushPopChecker::rootIfGlobal(SymbolRef SymByItself, CheckerContext &C) const {
+    const MemRegion *R = SymByItself->getOriginRegion();
+    if (!R)
+        return false;
+    const VarRegion *VR = R->getAs<VarRegion>();
+    if (!VR)
+        return false;
+    const VarDecl *VD = VR->getDecl();
+    if (!VD->hasGlobalStorage())
+        return false;
+    if (!isGCTrackedType(VD->getType()))
+        return false;
+    const ValueState *GVState = C.getState()->get<GCValueMap>(SymByItself);
+    if (GVState)
+      return false;
+    C.addTransition(C.getState()->set<GCValueMap>(SymByItself,
+        (declHasAnnotation(VD, "julia_globally_rooted") ||
+        isGloballyRootedType(VD->getType())) ?
+        ValueState::getRooted(nullptr) : ValueState::getAllocated()));
+    return true;
+}
+
 void GCPushPopChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
     // If it's just the symbol by itself, let it be. We allow dead pointer to be
-    // passed around, so long as they're not accessed.
-    if (Loc.getAsSymbol(false))
+    // passed around, so long as they're not accessed. However, we do want to
+    // start tracking any globals that may have been accessed.
+    SymbolRef SymByItself = Loc.getAsSymbol(false);
+    SValExplainer Ex(C.getASTContext());
+    if (SymByItself) {
+      rootIfGlobal(SymByItself, C);
       return;
+    }
     // This will walk backwards until it finds the base symbol
     SymbolRef Sym = Loc.getAsSymbol(true);
     if (!Sym)

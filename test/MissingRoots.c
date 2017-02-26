@@ -113,3 +113,24 @@ int unrooted() {
   return val->length == 1; // expected-warning{{Trying to access value which may have been GCed}}
                            // expected-note@-1{{Trying to access value which may have been GCed}}
 }
+
+extern jl_value_t *global_value GLOBALLY_ROOTED; 
+extern void look_at_value(jl_value_t *v);
+extern void globally_rooted() {
+  jl_value_t *val = global_value;
+  jl_gc_safepoint();
+  look_at_value(val);
+  JL_GC_PUSH1(&val);
+  jl_gc_safepoint();
+  look_at_value(val);
+  JL_GC_POP();
+  jl_gc_safepoint();
+  look_at_value(val);
+}
+
+extern jl_value_t *first_array_elem(jl_array_t *a PROPAGATES_ROOT);
+extern void root_propagation(jl_expr_t *expr) {
+  jl_value_t *val = first_array_elem(expr->args);
+  jl_gc_safepoint();
+  look_at_value(val);
+}

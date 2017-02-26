@@ -10,11 +10,15 @@ module ClangSA
       #undef GCValueMap
       #undef GCValueMapTy
       #undef registerGcPushPopChecker
+      #undef GCRootMap
+      #undef GCRootMapTy
       #define JuliaAnalysisAction JuliaAnalysisAction$tok
       #define GCPushPopChecker GCPushPopChecker$tok
       #define GCDepth GCDepth$tok
       #define GCValueMap GCValueMap$tok
       #define GCValueMapTy GCValueMap$(tok)Ty
+      #define GCRootMap GCRootMap$tok
+      #define GCRootMapTy GCRootMap$(tok)Ty
       #define registerGcPushPopChecker registerGcPushPopChecker$tok
     """
     Cxx.cxxparse(hack)
@@ -27,9 +31,11 @@ module ClangSA
         #include "clang/StaticAnalyzer/Core/Checker.h"
         #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
         #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+        #include "clang/StaticAnalyzer/Core/PathSensitive/SVals.h"
         #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
         #include "clang/StaticAnalyzer/Core/BugReporter/CommonBugCategories.h"
         #include "clang/StaticAnalyzer/Frontend/AnalysisConsumer.h"
+        #include "clang/StaticAnalyzer/Checkers/SValExplainer.h"
         #include <iostream>
     """
     

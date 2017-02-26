@@ -1,7 +1,23 @@
 module ClangSA
     using Cxx
-    const __current_compiler__ = Cxx.new_clang_instance(true, false)
-    Main.CxxREPL.addClangHeaders(__current_compiler__)
+
+    # Avoid C++ side code-reuse when re-loading the package
+    tok = join(rand('a':'z', 5))
+    hack = """
+      #undef JuliaAnalysisAction
+      #undef GCPushPopChecker
+      #undef GCDepth
+      #undef GCValueMap
+      #undef GCValueMapTy
+      #undef registerGcPushPopChecker
+      #define JuliaAnalysisAction JuliaAnalysisAction$tok
+      #define GCPushPopChecker GCPushPopChecker$tok
+      #define GCDepth GCDepth$tok
+      #define GCValueMap GCValueMap$tok
+      #define GCValueMapTy GCValueMap$(tok)Ty
+      #define registerGcPushPopChecker registerGcPushPopChecker$tok
+    """
+    Cxx.cxxparse(hack)
 
     cxx"""
         #include "clang/Tooling/Tooling.h"
@@ -18,7 +34,8 @@ module ClangSA
     """
     
     # The analysis
-    Cxx.cxxinclude(__current_compiler__, joinpath(dirname(@__FILE__), "GCChecker.cpp"))
+    # N.B.: The use of cxxparse here avoids Clang's include caching
+    Cxx.cxxparse(__current_compiler__, readstring(joinpath(dirname(@__FILE__), "GCChecker.cpp")))
     
     # Frontend Action that registers the above analysis action
     cxx"""

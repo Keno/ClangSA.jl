@@ -134,3 +134,23 @@ extern void root_propagation(jl_expr_t *expr) {
   jl_gc_safepoint();
   look_at_value(val);
 }
+
+extern void argument_propagation(jl_value_t *a) {
+  jl_svec_t *types = jl_svec2(NULL, NULL);
+  JL_GC_PUSH1(&types);
+  jl_value_t *val = jl_svecset(types, 0, jl_typeof(a));
+  jl_gc_safepoint();
+  look_at_value(val);
+  jl_svecset(types, 1, jl_typeof(a));
+  JL_GC_POP();
+}
+
+extern void arg_array(jl_value_t **args) {
+  jl_gc_safepoint();
+  jl_value_t *val = args[0];
+  look_at_value(val);
+  jl_value_t *val2 = NULL;
+  JL_GC_PUSH1(&val2);
+  val2 = val;
+  JL_GC_POP();
+}

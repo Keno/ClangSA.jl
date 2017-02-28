@@ -400,8 +400,6 @@ bool GCPushPopChecker::propagateArgumentRootedness(CheckerContext &C, ProgramSta
         auto Param = State->getLValue(P, LCtx);
         SymbolRef ParamSym = State->getSVal(Param).getAsSymbol();
         if (!ParamSym) {
-            std::cout << "This is weird: " << std::endl;
-            P->dump();
             continue;
         }
         if (isGloballyRootedType(P->getType())) {
@@ -523,7 +521,8 @@ bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
   bool isCalleeSafepoint = true;
   if (Call.isGlobalCFunction("malloc") ||
       Call.isGlobalCFunction("memcpy") ||
-      Call.isGlobalCFunction("memset")) {
+      Call.isGlobalCFunction("memset") ||
+      Call.isGlobalCFunction("memcmp")) {
     isCalleeSafepoint = false;
   } else {
     auto *Decl = Call.getDecl();
@@ -536,6 +535,7 @@ bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
 
         case Builtin::BI__builtin_expect:
         case Builtin::BI__builtin_alloca:
+        case Builtin::BI__builtin_bswap64:
           isCalleeSafepoint = false;
       }
     }
@@ -624,16 +624,20 @@ bool GCPushPopChecker::processAllocationOfResult(const CallEvent &Call, CheckerC
       auto *Decl = Call.getDecl();
       const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
       if (!FD)
-          return false;          
-      for (int i = 0; i < FD->getNumParams(); ++i) {
-          if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
-              // Walk backwards to find the region that roots this value
-              const MemRegion *Region = Call.getArgSVal(i).getAsRegion();
-              const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
-              if (OldVState)
-                  NewVState = *OldVState;
-              break;
-          }
+          return false; 
+      if (declHasAnnotation(FD, "julia_globally_rooted")) {
+          NewVState = ValueState::getRooted(nullptr);
+      } else {  
+        for (int i = 0; i < FD->getNumParams(); ++i) {
+            if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
+                // Walk backwards to find the region that roots this value
+                const MemRegion *Region = Call.getArgSVal(i).getAsRegion();
+                const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
+                if (OldVState)
+                    NewVState = *OldVState;
+                break;
+            }
+        }
       }
       State = State->set<GCValueMap>(Sym, NewVState);
   }

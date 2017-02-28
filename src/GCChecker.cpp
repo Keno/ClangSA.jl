@@ -501,6 +501,7 @@ bool GCPushPopChecker::isGCTrackedType(QualType QT) const {
           Name.endswith_lower("jl_tupletype_t") ||
           Name.endswith_lower("jl_datatype_t") ||
           Name.endswith_lower("jl_typemap_entry_t") ||
+          Name.endswith_lower("jl_typename_t") ||
           // Probably not technically true for these, but let's allow it
           Name.endswith_lower("typemap_intersection_env")
           ) {
@@ -522,7 +523,8 @@ bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
   if (Call.isGlobalCFunction("malloc") ||
       Call.isGlobalCFunction("memcpy") ||
       Call.isGlobalCFunction("memset") ||
-      Call.isGlobalCFunction("memcmp")) {
+      Call.isGlobalCFunction("memcmp") ||
+      Call.isGlobalCFunction("strrchr")) {
     isCalleeSafepoint = false;
   } else {
     auto *Decl = Call.getDecl();

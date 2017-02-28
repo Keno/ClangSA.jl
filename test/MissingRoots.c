@@ -1,7 +1,6 @@
 // RUN: %clang_cc1 -analyze -analyzer-checker=core,julia.gcpushpop -verify -x c++ %s
 
 #include "julia.h"
-
 void unrooted_argument() {
     jl_(jl_svec1(NULL)); // expected-warning{{Passing non-rooted value as argument to function}}
                          // expected-note@-1{{Passing non-rooted value as argument to function}}
@@ -201,4 +200,22 @@ void global_array3() {
   tm = call_cache[1];
   val = tm->func.linfo;
   look_at_val(val);
+}
+
+static inline look_at_val2(jl_value_t *v) {
+  look_at_val(v);
+}
+void mtable(jl_value_t *f) {
+  look_at_val2(jl_gf_mtable(f));
+  jl_value_t *val = NULL;
+  JL_GC_PUSH1(&val);
+  val = jl_gf_mtable(f);
+  JL_GC_POP();
+}
+
+void mtable2(jl_value_t **v) {
+  jl_value_t *val = NULL;
+  JL_GC_PUSH1(&val);
+  val = jl_gf_mtable(v[2]);
+  JL_GC_POP();
 }

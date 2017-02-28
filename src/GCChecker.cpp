@@ -230,6 +230,10 @@ PDP GCPushPopChecker::GCValueBugVisitor::ExplainNoPropagation(
             if (!declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root"))
                 continue;
             const MemRegion *Region = N->getState()->getSVal(CE->getArg(i), N->getLocationContext()).getAsRegion();
+            SValExplainer Ex(BRC.getASTContext());
+            std::cout << "Debug 1 " << Ex.Visit(N->getState()->getSVal(CE->getArg(i), N->getLocationContext())) << std::endl;
+            if (Region)
+                std::cout << "Debug " << Ex.Visit(Region) << std::endl;
             SymbolRef Parent = walkToRoot([](const ValueState *OldVState) {return !OldVState;},
                 N->getState(), Region);
             if (!Parent) {
@@ -371,7 +375,8 @@ bool GCPushPopChecker::propagateArgumentRootedness(CheckerContext &C, ProgramSta
            continue;
         }
         auto Arg = State->getSVal(CE->getArg(idx++), LCtx->getParent());
-        SymbolRef ArgSym = Arg.getAsSymbol();
+        SymbolRef ArgSym = walkToRoot([](const ValueState *OldVState) {return !OldVState;},
+            State, Arg.getAsRegion());
         if (!ArgSym) {
             continue;
         }
@@ -856,6 +861,7 @@ void GCPushPopChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, Che
             C.addTransition(State);
             return;
         }
+        std::cout << "Allocation was " << Ex.Visit(Sym) << std::endl;
         report_error(C, "Saw assignment to root, but missed the allocation");
         return;
     }

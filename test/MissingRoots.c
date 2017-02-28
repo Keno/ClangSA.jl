@@ -1,6 +1,7 @@
 // RUN: %clang_cc1 -analyze -analyzer-checker=core,julia.gcpushpop -verify -x c++ %s
 
 #include "julia.h"
+
 void unrooted_argument() {
     jl_(jl_svec1(NULL)); // expected-warning{{Passing non-rooted value as argument to function}}
                          // expected-note@-1{{Passing non-rooted value as argument to function}}
@@ -227,4 +228,16 @@ void tparam0(jl_value_t *atype) {
 extern jl_value_t *global_atype GLOBALLY_ROOTED;
 void tparam0_global() {
    look_at_value(jl_tparam0(global_atype));
+}
+
+static jl_value_t *some_global GLOBALLY_ROOTED;
+void global_copy() {
+    jl_value_t *local = NULL;
+    jl_gc_safepoint();
+    JL_GC_PUSH1(&local);
+    local = some_global;
+    some_global = NULL;
+    jl_gc_safepoint();
+    look_at_value(some_global);
+    JL_GC_POP();
 }

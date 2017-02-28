@@ -938,20 +938,21 @@ void GCPushPopChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, Check
     // If it's just the symbol by itself, let it be. We allow dead pointer to be
     // passed around, so long as they're not accessed. However, we do want to
     // start tracking any globals that may have been accessed.
+    ProgramStateRef State = C.getState();
+    if (rootRegionIfGlobal(Loc.getAsRegion(), State, C)) {
+        C.addTransition(State);
+        return;
+    }
     SymbolRef SymByItself = Loc.getAsSymbol(false);
-    SValExplainer Ex(C.getASTContext());
     if (SymByItself) {
-      ProgramStateRef State = C.getState();
-      if (rootRegionIfGlobal(Loc.getAsRegion(), State, C))
-          C.addTransition(State);
-      return;
+        return;
     }
     // This will walk backwards until it finds the base symbol
     SymbolRef Sym = Loc.getAsSymbol(true);
     if (!Sym) {
       return;
     }
-    const ValueState *VState = C.getState()->get<GCValueMap>(Sym);
+    const ValueState *VState = State->get<GCValueMap>(Sym);
     if (!VState)
       return;
     if (VState->isPotentiallyFreed()) {

@@ -199,14 +199,14 @@ void global_array3() {
   jl_typemap_entry_t *tm = NULL;
   tm = call_cache[1];
   val = tm->func.linfo;
-  look_at_val(val);
+  look_at_value(val);
 }
 
-static inline look_at_val2(jl_value_t *v) {
-  look_at_val(v);
+static inline look_at_value2(jl_value_t *v) {
+  look_at_value(v);
 }
 void mtable(jl_value_t *f) {
-  look_at_val2(jl_gf_mtable(f));
+  look_at_value2(jl_gf_mtable(f));
   jl_value_t *val = NULL;
   JL_GC_PUSH1(&val);
   val = jl_gf_mtable(f);
@@ -218,4 +218,13 @@ void mtable2(jl_value_t **v) {
   JL_GC_PUSH1(&val);
   val = jl_gf_mtable(v[2]);
   JL_GC_POP();
+}
+
+void tparam0(jl_value_t *atype) {
+   look_at_value(jl_tparam0(atype));
+}
+
+extern jl_value_t *global_atype GLOBALLY_ROOTED;
+void tparam0_global() {
+   look_at_value(jl_tparam0(global_atype));
 }

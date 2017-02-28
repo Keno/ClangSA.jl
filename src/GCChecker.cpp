@@ -200,6 +200,37 @@ SymbolRef GCPushPopChecker::walkToRoot(callback f, const ProgramStateRef &State,
     }
 }
 
+
+namespace Helpers {
+  static SymbolRef trySuperRegion(SValExplainer &Ex, ProgramStateRef State, SVal Val) {
+      const MemRegion *R = Val.getAsRegion();
+      const SubRegion *SR = R->getAs<SubRegion>();
+      return SR ? State->getSVal(SR->getSuperRegion()).getAsSymbol() : nullptr;
+  }
+  
+  static const VarRegion *walk_back_to_global_VR(const MemRegion *Region) {
+    while (true) {
+        const VarRegion *VR = Region->getAs<VarRegion>();
+        if (VR && VR->getDecl()->hasGlobalStorage()) {
+            return VR;
+        }
+        const SymbolicRegion *SymR = Region->getAs<SymbolicRegion>();
+        if (SymR) {
+            const SymbolRegionValue *SymRV = dyn_cast<SymbolRegionValue>(SymR->getSymbol());
+            if (!SymRV)
+                break;
+            Region = SymRV->getRegion();
+            continue;
+        }
+        const SubRegion *SR = Region->getAs<SubRegion>();
+        if (!SR)
+            break;
+        Region = SR->getSuperRegion();
+    }
+    return nullptr;
+  }
+}
+
 PDP GCPushPopChecker::GCBugVisitor::VisitNode(
   const ExplodedNode *N, const ExplodedNode *PrevN,
   BugReporterContext &BRC, BugReport &BR) {
@@ -232,11 +263,15 @@ PDP GCPushPopChecker::GCValueBugVisitor::ExplainNoPropagation(
             const MemRegion *Region = N->getState()->getSVal(CE->getArg(i), N->getLocationContext()).getAsRegion();
             SValExplainer Ex(BRC.getASTContext());
             std::cout << "Debug 1 " << Ex.Visit(N->getState()->getSVal(CE->getArg(i), N->getLocationContext())) << std::endl;
-            if (Region)
-                std::cout << "Debug " << Ex.Visit(Region) << std::endl;
             SymbolRef Parent = walkToRoot([](const ValueState *OldVState) {return !OldVState;},
                 N->getState(), Region);
             if (!Parent) {
+                // May have been derived from a global. Check that
+                const VarRegion *VR = Helpers::walk_back_to_global_VR(Region);
+                if (VR) {
+                  BR.addNote("Derivation root was here", PathDiagnosticLocation::create(VR->getDecl(), BRC.getSourceManager()));
+                  return MakePDP(Pos, "Argument value was derived from global. May need GLOBALLY_ROOTED annotation.");                      
+                }
                 return MakePDP(Pos, "Argument value was untracked.");
             }
             const ValueState *ValS = N->getState()->get<GCValueMap>(Parent);
@@ -486,7 +521,9 @@ bool GCPushPopChecker::isGloballyRootedType(QualType QT) const {
 bool GCPushPopChecker::isSafepoint(const CallEvent &Call) const
 {
   bool isCalleeSafepoint = true;
-  if (Call.isGlobalCFunction("malloc")) {
+  if (Call.isGlobalCFunction("malloc") ||
+      Call.isGlobalCFunction("memcpy") ||
+      Call.isGlobalCFunction("memset")) {
     isCalleeSafepoint = false;
   } else {
     auto *Decl = Call.getDecl();
@@ -622,14 +659,6 @@ void GCPushPopChecker::checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C
     C.addTransition(C.getState()->set<GCValueMap>(Sym, ValueState::getRooted(nullptr)));
 }
 
-namespace Helpers {
-  static SymbolRef trySuperRegion(SValExplainer &Ex, ProgramStateRef State, SVal Val) {
-      const MemRegion *R = Val.getAsRegion();
-      const SubRegion *SR = R->getAs<SubRegion>();
-      return SR ? State->getSVal(SR->getSuperRegion()).getAsSymbol() : nullptr;
-  }
-}
-
 void GCPushPopChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, CheckerContext &C) const
 {
     // This is the pointer
@@ -654,8 +683,8 @@ void GCPushPopChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent,
     }
     const MemRegion *Region = C.getSVal(Parent).getAsRegion();
     if (Region) {
-      const SubRegion *SR = Region->getAs<SubRegion>();
-      if (SR && rootRegionIfGlobal(SR->getSuperRegion(), State, C)) {
+      const VarRegion *VR = Helpers::walk_back_to_global_VR(Region);
+      if (VR && rootRegionIfGlobal(VR, State, C)) {
           C.addTransition(State->set<GCValueMap>(NewSym, ValueState::getRooted(Region)));
           return;
       }

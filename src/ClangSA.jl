@@ -12,6 +12,7 @@ module ClangSA
       #undef registerGcPushPopChecker
       #undef GCRootMap
       #undef GCRootMapTy
+      #undef Helpers
       #define JuliaAnalysisAction JuliaAnalysisAction$tok
       #define GCPushPopChecker GCPushPopChecker$tok
       #define GCDepth GCDepth$tok
@@ -19,6 +20,7 @@ module ClangSA
       #define GCValueMapTy GCValueMap$(tok)Ty
       #define GCRootMap GCRootMap$tok
       #define GCRootMapTy GCRootMap$(tok)Ty
+      #define Helpers Helpers$(tok)
       #define registerGcPushPopChecker registerGcPushPopChecker$tok
     """
     Cxx.cxxparse(hack)

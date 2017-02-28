@@ -2,6 +2,14 @@ namespace {
     using namespace clang;
     using namespace ento;
   
+#if LLVM_VERSION_MAJOR >= 4
+    #define PDP std::shared_ptr<PathDiagnosticPiece>
+    #define MakePDP llvm::make_unique<PathDiagnosticEventPiece>
+#else
+    #define PDP clang::ento::PathDiagnosticPiece * 
+    #define MakePDP new clang::ento::PathDiagnosticEventPiece
+#endif        
+  
     class GCPushPopChecker : public Checker<eval::Call,
                                             check::BeginFunction,
                                             check::EndFunction,
@@ -9,11 +17,16 @@ namespace {
                                             check::PreCall,
                                             check::PostStmt<CStyleCastExpr>,
                                             check::PostStmt<ArraySubscriptExpr>,
+                                            check::PostStmt<MemberExpr>,
                                             check::Bind,
                                             check::Location
                                             > {
         mutable std::unique_ptr<BugType> BT;
-        void report_error(CheckerContext &C, const char *message) const;
+        template <typename callback>
+        void report_error(callback f, CheckerContext &C, const char *message) const;
+        void report_error(CheckerContext &C, const char *message) const {
+            return report_error([](BugReport *){}, C, message);
+        }
         void report_value_error(CheckerContext &C, SymbolRef Sym, const char *message, clang::SourceRange range = clang::SourceRange()) const;
     
     public:
@@ -47,9 +60,9 @@ namespace {
         
         struct RootState {
             enum Kind { Root, RootArray } K;
-            unsigned RootedAtDepth;
+            int RootedAtDepth;
             
-            RootState(Kind InK, unsigned Depth) : K(InK), RootedAtDepth(Depth) {}
+            RootState(Kind InK, int Depth) : K(InK), RootedAtDepth(Depth) {}
             
             bool operator==(const RootState &VS) const {
                 return K == VS.K && RootedAtDepth == VS.RootedAtDepth;
@@ -58,7 +71,7 @@ namespace {
                 return K != VS.K || RootedAtDepth != VS.RootedAtDepth;
             }
             
-            bool shouldPopAtDepth(unsigned Depth) const { return Depth == RootedAtDepth; }
+            bool shouldPopAtDepth(int Depth) const { return Depth == RootedAtDepth; }
             bool isRootArray() const { return K == RootArray; }
             
             void Profile(llvm::FoldingSetNodeID &ID) const {
@@ -66,16 +79,18 @@ namespace {
                 ID.AddInteger(RootedAtDepth);
             }
             
-            static RootState getRoot(unsigned Depth) { return RootState(Root, Depth); }
-            static RootState getRootArray(unsigned Depth) { return RootState(RootArray, Depth); }
+            static RootState getRoot(int Depth) { return RootState(Root, Depth); }
+            static RootState getRootArray(int Depth) { return RootState(RootArray, Depth); }
         };
         
     private:
         template <typename callback>
         static bool isJuliaType(callback f, QualType QT) {
-          if (!QT->isPointerType())
+          if (!QT->isPointerType() && !QT->isArrayType())
               return false;
-          QT = QT->getPointeeType();
+          QT = QualType(QT->getPointeeOrArrayElementType(), 0);
+          if (QT->isPointerType())
+              return isJuliaType(f, QT);
           const TypedefType *TT = QT->getAs<TypedefType>();
           if (TT) {
               if (f(TT->getDecl()->getName()))
@@ -92,6 +107,7 @@ namespace {
         
         bool isGCTrackedType(QualType Type) const;
         bool isGloballyRootedType(QualType Type) const;
+        bool isBundleOfGCValues(QualType QT) const;
         static void dumpState(const ProgramStateRef &State);
         static bool declHasAnnotation(const clang::Decl *D, const char *which);
         bool isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) const;
@@ -99,7 +115,7 @@ namespace {
         bool processPotentialSafepoint(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
         bool processAllocationOfResult(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
         bool processArgumentRooting(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
-        bool rootIfGlobal(SymbolRef SymByItself, CheckerContext &C) const;
+        bool rootRegionIfGlobal(const MemRegion *R, ProgramStateRef &, CheckerContext &C) const;
         static const ValueState *getValStateForRegion(ASTContext &AstC, const ProgramStateRef &State, const MemRegion *R, bool Debug = false);
         bool gcEnabledHere(CheckerContext &C) const;
         bool propagateArgumentRootedness(CheckerContext &C, ProgramStateRef &State) const;
@@ -112,6 +128,8 @@ namespace {
         void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
         void checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C) const;
         void checkPostStmt(const ArraySubscriptExpr *CE, CheckerContext &C) const;
+        void checkPostStmt(const MemberExpr *ME, CheckerContext &C) const;
+        void checkDerivingExpr(const Expr *Result, const Expr *Parent, CheckerContext &C) const;
         void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
         void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &) const;
         class GCBugVisitor
@@ -124,7 +142,7 @@ namespace {
             ID.AddPointer(&X);
           }
 
-          clang::ento::PathDiagnosticPiece * VisitNode(const ExplodedNode *N,
+          PDP VisitNode(const ExplodedNode *N,
                                                          const ExplodedNode *PrevN,
                                                          BugReporterContext &BRC,
                                                          BugReport &BR) override;
@@ -144,9 +162,9 @@ namespace {
             ID.AddPointer(Sym);
           }
 
-          clang::ento::PathDiagnosticPiece *ExplainNoPropagation(
+          PDP ExplainNoPropagation(
               const ExplodedNode *N, PathDiagnosticLocation Pos, BugReporterContext &BRC, BugReport &BR);
-          clang::ento::PathDiagnosticPiece * VisitNode(const ExplodedNode *N,
+          PDP VisitNode(const ExplodedNode *N,
                                                          const ExplodedNode *PrevN,
                                                          BugReporterContext &BRC,
                                                          BugReport &BR) override;
@@ -182,7 +200,7 @@ SymbolRef GCPushPopChecker::walkToRoot(callback f, const ProgramStateRef &State,
     }
 }
 
-clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCBugVisitor::VisitNode(
+PDP GCPushPopChecker::GCBugVisitor::VisitNode(
   const ExplodedNode *N, const ExplodedNode *PrevN,
   BugReporterContext &BRC, BugReport &BR) {
     unsigned NewGCDepth = N->getState()->get<GCDepth>();
@@ -192,12 +210,12 @@ clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCBugVisitor::VisitNode(
                            BRC.getSourceManager(),
                            N->getLocationContext());
       // std::make_shared< in later LLVM
-      return new PathDiagnosticEventPiece(Pos, "GC frame changed here.");
+      return MakePDP(Pos, "GC frame changed here.");
     }
     return nullptr;
 }
 
-clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCValueBugVisitor::ExplainNoPropagation(
+PDP GCPushPopChecker::GCValueBugVisitor::ExplainNoPropagation(
     const ExplodedNode *N, PathDiagnosticLocation Pos, BugReporterContext &BRC, BugReport &BR)
 {
     if (N->getLocation().getAs<StmtPoint>()) {
@@ -215,16 +233,16 @@ clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCValueBugVisitor::ExplainNo
             SymbolRef Parent = walkToRoot([](const ValueState *OldVState) {return !OldVState;},
                 N->getState(), Region);
             if (!Parent) {
-                return new PathDiagnosticEventPiece(Pos, "Argument value was untracked.");
+                return MakePDP(Pos, "Argument value was untracked.");
             }
             const ValueState *ValS = N->getState()->get<GCValueMap>(Parent);
             assert(ValS);
             if (ValS->isPotentiallyFreed()) {
                 BR.addVisitor(llvm::make_unique<GCValueBugVisitor>(Parent));
-                return new PathDiagnosticEventPiece(Pos, "Root not propagated because it may have been freed. Tracking.");
+                return MakePDP(Pos, "Root not propagated because it may have been freed. Tracking.");
             } else {
                 BR.addVisitor(llvm::make_unique<GCValueBugVisitor>(Parent));
-                return new PathDiagnosticEventPiece(Pos, "No Root to propagate. Tracking.");
+                return MakePDP(Pos, "No Root to propagate. Tracking.");
             }
         }
         return nullptr;
@@ -232,7 +250,7 @@ clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCValueBugVisitor::ExplainNo
     return nullptr;
 }
 
-clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCValueBugVisitor::VisitNode(
+PDP GCPushPopChecker::GCValueBugVisitor::VisitNode(
   const ExplodedNode *N, const ExplodedNode *PrevN,
   BugReporterContext &BRC, BugReport &BR) {
     const ValueState *NewValueState = N->getState()->get<GCValueMap>(Sym);
@@ -251,29 +269,30 @@ clang::ento::PathDiagnosticPiece *GCPushPopChecker::GCValueBugVisitor::VisitNode
       return nullptr;
     if (!OldValueState) {
         if (NewValueState->isRooted()) {
-            return new PathDiagnosticEventPiece(Pos, "Started tracking value here (root was inherited).");            
+            return MakePDP(Pos, "Started tracking value here (root was inherited).");            
         } else {
-            clang::ento::PathDiagnosticPiece *Diag = ExplainNoPropagation(N, Pos, BRC, BR);
+            PDP Diag = ExplainNoPropagation(N, Pos, BRC, BR);
             if (Diag)
                 return Diag;
-            return new PathDiagnosticEventPiece(Pos, "Started tracking value here.");
+            return MakePDP(Pos, "Started tracking value here.");
         }
     }
     if (NewValueState->isPotentiallyFreed() &&
         OldValueState->isJustAllocated()) {
       // std::make_shared< in later LLVM
-      return new PathDiagnosticEventPiece(Pos, "Value may have been GCed here.");
+      return MakePDP(Pos, "Value may have been GCed here.");
     } else if (NewValueState->isRooted() &&
                OldValueState->isJustAllocated()) {
-      return new PathDiagnosticEventPiece(Pos, "Value was rooted here.");      
+      return MakePDP(Pos, "Value was rooted here.");      
     } else if (NewValueState->isJustAllocated() &&
                OldValueState->isRooted()) {
-      return new PathDiagnosticEventPiece(Pos, "Root was released here.");    
+      return MakePDP(Pos, "Root was released here.");    
     }
     return nullptr;
 }
 
-void GCPushPopChecker::report_error(CheckerContext &C, const char *message) const
+template <typename callback>
+void GCPushPopChecker::report_error(callback f, CheckerContext &C, const char *message) const
 {
     // Generate an error node.
     ExplodedNode *N = C.generateErrorNode();
@@ -285,6 +304,7 @@ void GCPushPopChecker::report_error(CheckerContext &C, const char *message) cons
                            categories::LogicError));
     auto Report = llvm::make_unique<BugReport>(*BT, message, N);
     Report->addVisitor(llvm::make_unique<GCBugVisitor>());
+    f(Report.get());
     C.emitReport(std::move(Report));
 }
 
@@ -357,8 +377,12 @@ bool GCPushPopChecker::propagateArgumentRootedness(CheckerContext &C, ProgramSta
         }
         const ValueState *ValS = State->get<GCValueMap>(ArgSym);
         if (!ValS) {
-            P->dump();
-            report_error(C, "Missed allocation of the value of this parameter");
+            std::cout << "Allocation was " << Ex.Visit(ArgSym) << std::endl;
+            report_error([&](BugReport *Report) {
+                Report->addNote(
+                  "Tried to find root for this parameter in inlined call",
+                  PathDiagnosticLocation::create(P, C.getSourceManager()));
+            }, C, "Missed allocation of parameter");
             continue;
         }
         State = State->set<GCValueMap>(ParamSym, *ValS);
@@ -419,6 +443,14 @@ bool GCPushPopChecker::isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) 
     return declHasAnnotation(FD, "julia_not_safepoint");
 }
 
+bool GCPushPopChecker::isBundleOfGCValues(QualType QT) const {
+    return isJuliaType([](StringRef Name) {
+      if (Name.endswith_lower("typemap_intersection_env"))
+          return true;
+      return false;
+    }, QT);
+}
+
 bool GCPushPopChecker::isGCTrackedType(QualType QT) const {
     return isJuliaType([](StringRef Name) {
       if (Name.endswith_lower("jl_value_t") ||
@@ -428,7 +460,12 @@ bool GCPushPopChecker::isGCTrackedType(QualType QT) const {
           Name.endswith_lower("jl_code_info_t") ||
           Name.endswith_lower("jl_array_t") ||
           Name.endswith_lower("jl_method_instance_t") ||
-          Name.endswith_lower("jl_tupletype_t")) {
+          Name.endswith_lower("jl_tupletype_t") ||
+          Name.endswith_lower("jl_datatype_t") ||
+          Name.endswith_lower("jl_typemap_entry_t") ||
+          // Probably not technically true for these, but let's allow it
+          Name.endswith_lower("typemap_intersection_env")
+          ) {
           return true;
       }
       return false; 
@@ -580,21 +617,69 @@ void GCPushPopChecker::checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C
     C.addTransition(C.getState()->set<GCValueMap>(Sym, ValueState::getRooted(nullptr)));
 }
 
-// Propagate rootedness through subscript
-void GCPushPopChecker::checkPostStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) const {
-    ASE->dump();
-    SymbolRef OldSym = C.getSVal(ASE->getLHS()).getAsSymbol();
-    SymbolRef NewSym = C.getSVal(ASE).getAsSymbol();
-    if (!OldSym || !NewSym)
-        return;
-    const ValueState *OldValS = C.getState()->get<GCValueMap>(OldSym);
-    if (!OldValS)
-        return;
-    if (OldValS->isPotentiallyFreed())
-        report_value_error(C, OldSym, "Indexing into value that may have been GCed");
-    else
-        C.addTransition(C.getState()->set<GCValueMap>(NewSym, *OldValS));
+namespace Helpers {
+  static SymbolRef trySuperRegion(SValExplainer &Ex, ProgramStateRef State, SVal Val) {
+      const MemRegion *R = Val.getAsRegion();
+      const SubRegion *SR = R->getAs<SubRegion>();
+      return SR ? State->getSVal(SR->getSuperRegion()).getAsSymbol() : nullptr;
+  }
 }
+
+void GCPushPopChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, CheckerContext &C) const
+{
+    // This is the pointer
+    SValExplainer Ex(C.getASTContext());
+    auto ValLoc = C.getSVal(Result).getAs<Loc>();
+    if (!ValLoc) {
+        return;
+    }
+    ProgramStateRef State = C.getState();
+    SVal Loaded = State->getSVal(*ValLoc);
+    if (Loaded.isUnknown()) {
+      QualType QT = Result->getType();
+      if (isGCTrackedType(QT)) {
+        Loaded = C.getSValBuilder().conjureSymbolVal(Result, C.getLocationContext(), QT,
+                                              C.blockCount());
+        State = State->bindLoc(*ValLoc, Loaded, C.getLocationContext());
+      }
+    }
+    SymbolRef NewSym = Loaded.getAsSymbol();
+    if (!NewSym) {
+        return;
+    }
+    const MemRegion *Region = C.getSVal(Parent).getAsRegion();
+    if (Region) {
+      const SubRegion *SR = Region->getAs<SubRegion>();
+      if (SR && rootRegionIfGlobal(SR->getSuperRegion(), State, C)) {
+          C.addTransition(State->set<GCValueMap>(NewSym, ValueState::getRooted(Region)));
+          return;
+      }
+    }
+    SymbolRef OldSym = C.getSVal(Parent).getAsSymbol(true);
+    if (!OldSym) {
+      return;
+    }
+    const ValueState *OldValS = State->get<GCValueMap>(OldSym);
+    if (!OldValS) {
+        return;
+    }
+    if (OldValS->isPotentiallyFreed())
+        report_value_error(C, OldSym, "Creating derivative of value that may have been GCed");
+    else
+        C.addTransition(State->set<GCValueMap>(NewSym, *OldValS));
+}
+
+// Propagate rootedness through subscript
+void GCPushPopChecker::checkPostStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) const
+{
+    checkDerivingExpr(ASE, ASE->getLHS(), C);
+}
+
+void GCPushPopChecker::checkPostStmt(const MemberExpr *ME, CheckerContext &C) const
+{
+    checkDerivingExpr(ME, ME->getBase(), C);
+}
+
 
 void GCPushPopChecker::dumpState(const ProgramStateRef &State) {
     GCValueMapTy AMap = State->get<GCValueMap>();
@@ -630,7 +715,7 @@ void GCPushPopChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) co
             continue;
         bool MaybeUnrooted = false;
         if (FD) {
-            if (!FD->isVariadic() || idx < FD->getNumParams())
+            if (idx < FD->getNumParams())
                 MaybeUnrooted = declHasAnnotation(FD->getParamDecl(idx), "julia_maybe_unrooted");
         }
         if (!MaybeUnrooted && isCalleeSafepoint) {
@@ -717,6 +802,10 @@ bool GCPushPopChecker::evalCall(const CallExpr *CE,
         const MemRegion *Region = MRV->getRegion()->StripCasts();
         SValExplainer Ex(C.getASTContext());
         State = State->set<GCRootMap>(Region, RootState::getRootArray(CurrentDepth));
+        // The Argument array may also be used as a value, so make it rooted
+        SymbolRef ArgArraySym = ArgArray.getAsSymbol();
+        assert(ArgArraySym);
+        State = State->set<GCValueMap>(ArgArraySym, ValueState::getRooted(Region));
         CurrentDepth += 1;
         State = State->set<GCDepth>(CurrentDepth);
         C.addTransition(State);
@@ -763,8 +852,10 @@ void GCPushPopChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, Che
     }
     const auto *RValState = State->get<GCValueMap>(Sym);
     if (!RValState) {
-        if (rootIfGlobal(Sym, C))
+        if (rootRegionIfGlobal(Sym->getOriginRegion(), State, C)) {
+            C.addTransition(State);
             return;
+        }
         report_error(C, "Saw assignment to root, but missed the allocation");
         return;
     }
@@ -773,11 +864,10 @@ void GCPushPopChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, Che
     C.addTransition(State->set<GCValueMap>(Sym, ValueState::getRooted(R)));
 }
 
-bool GCPushPopChecker::rootIfGlobal(SymbolRef SymByItself, CheckerContext &C) const {
-    assert(SymByItself);
-    const MemRegion *R = SymByItself->getOriginRegion();
+bool GCPushPopChecker::rootRegionIfGlobal(const MemRegion *R, ProgramStateRef &State, CheckerContext &C) const {
     if (!R)
         return false;
+    SValExplainer Ex(C.getASTContext());
     const VarRegion *VR = R->getAs<VarRegion>();
     if (!VR)
         return false;
@@ -787,13 +877,19 @@ bool GCPushPopChecker::rootIfGlobal(SymbolRef SymByItself, CheckerContext &C) co
         return false;
     if (!isGCTrackedType(VD->getType()))
         return false;
-    const ValueState *GVState = C.getState()->get<GCValueMap>(SymByItself);
-    if (GVState)
-      return false;
-    C.addTransition(C.getState()->set<GCValueMap>(SymByItself,
-        (declHasAnnotation(VD, "julia_globally_rooted") ||
-        isGloballyRootedType(VD->getType())) ?
-        ValueState::getRooted(nullptr) : ValueState::getAllocated()));
+    bool isGlobalRoot = false;
+    if (declHasAnnotation(VD, "julia_globally_rooted") ||
+        isGloballyRootedType(VD->getType())) {
+        State = State->set<GCRootMap>(R, RootState::getRoot(-1));
+        isGlobalRoot = true;
+    }
+    SVal TheVal = State->getSVal(R);
+    SymbolRef Sym = TheVal.getAsSymbol();
+    if (Sym) {
+        const ValueState *GVState = C.getState()->get<GCValueMap>(Sym);
+        if (!GVState)
+            State = State->set<GCValueMap>(Sym, isGlobalRoot ? ValueState::getRooted(R) : ValueState::getAllocated());
+    }
     return true;
 }
 
@@ -804,7 +900,9 @@ void GCPushPopChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, Check
     SymbolRef SymByItself = Loc.getAsSymbol(false);
     SValExplainer Ex(C.getASTContext());
     if (SymByItself) {
-      rootIfGlobal(SymByItself, C);
+      ProgramStateRef State = C.getState();
+      if (rootRegionIfGlobal(Loc.getAsRegion(), State, C))
+          C.addTransition(State);
       return;
     }
     // This will walk backwards until it finds the base symbol

@@ -116,7 +116,7 @@ int unrooted() {
 
 extern jl_value_t *global_value GLOBALLY_ROOTED; 
 extern void look_at_value(jl_value_t *v);
-extern void globally_rooted() {
+void globally_rooted() {
   jl_value_t *val = global_value;
   jl_gc_safepoint();
   look_at_value(val);
@@ -129,13 +129,13 @@ extern void globally_rooted() {
 }
 
 extern jl_value_t *first_array_elem(jl_array_t *a PROPAGATES_ROOT);
-extern void root_propagation(jl_expr_t *expr) {
+void root_propagation(jl_expr_t *expr) {
   jl_value_t *val = first_array_elem(expr->args);
   jl_gc_safepoint();
   look_at_value(val);
 }
 
-extern void argument_propagation(jl_value_t *a) {
+void argument_propagation(jl_value_t *a) {
   jl_svec_t *types = jl_svec2(NULL, NULL);
   JL_GC_PUSH1(&types);
   jl_value_t *val = jl_svecset(types, 0, jl_typeof(a));
@@ -145,12 +145,60 @@ extern void argument_propagation(jl_value_t *a) {
   JL_GC_POP();
 }
 
-extern void arg_array(jl_value_t **args) {
+// New value creation via []
+void arg_array(jl_value_t **args) {
   jl_gc_safepoint();
-  jl_value_t *val = args[0];
+  jl_value_t *val = args[1];
   look_at_value(val);
   jl_value_t *val2 = NULL;
   JL_GC_PUSH1(&val2);
   val2 = val;
   JL_GC_POP();
+}
+
+// New value creation via ->
+void member_expr(jl_expr_t *e) {
+  jl_value_t *val = NULL;
+  JL_GC_PUSH1(&val);
+  val = e->args;
+  JL_GC_POP();
+}
+
+void member_expr2(jl_typemap_entry_t *tm) {
+  jl_value_t *val = NULL;
+  JL_GC_PUSH1(&val);
+  val = tm->func.linfo;
+  JL_GC_POP();
+}
+
+static inline void look_at_args(jl_value_t **args) {
+  look_at_value(args[1]);
+  jl_value_t *val = NULL;
+  JL_GC_PUSH1(&val);
+  val = args[2];
+  JL_GC_POP();
+}
+
+void pushargs_as_args()
+{
+  jl_value_t **args;
+  JL_GC_PUSHARGS(args, 5);
+  look_at_args(args);
+  JL_GC_POP();
+}
+
+static jl_typemap_entry_t *call_cache[10] GLOBALLY_ROOTED;
+void global_array2() {
+  jl_value_t *val = NULL;
+  JL_GC_PUSH1(&val);
+  val = call_cache[1]->func.linfo;
+  JL_GC_POP();
+}
+
+void global_array3() {
+  jl_value_t *val = NULL;
+  jl_typemap_entry_t *tm = NULL;
+  tm = call_cache[1];
+  val = tm->func.linfo;
+  look_at_val(val);
 }

@@ -7,6 +7,7 @@ module ClangSA
       #undef JuliaAnalysisAction
       #undef GCPushPopChecker
       #undef GCDepth
+      #undef GCDisabledAt
       #undef GCValueMap
       #undef GCValueMapTy
       #undef registerGcPushPopChecker
@@ -16,6 +17,7 @@ module ClangSA
       #define JuliaAnalysisAction JuliaAnalysisAction$tok
       #define GCPushPopChecker GCPushPopChecker$tok
       #define GCDepth GCDepth$tok
+      #define GCDisabledAt GCDisabledAt$tok
       #define GCValueMap GCValueMap$tok
       #define GCValueMapTy GCValueMap$(tok)Ty
       #define GCRootMap GCRootMap$tok

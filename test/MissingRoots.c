@@ -2,6 +2,7 @@
 
 #include "julia.h"
 
+/*
 void unrooted_argument() {
     jl_(jl_svec1(NULL)); // expected-warning{{Passing non-rooted value as argument to function}}
                          // expected-note@-1{{Passing non-rooted value as argument to function}}
@@ -240,4 +241,33 @@ void global_copy() {
     jl_gc_safepoint();
     look_at_value(some_global);
     JL_GC_POP();
+}
+
+// Check that rooting the same value twice uses to oldest scope
+void scopes() {
+    jl_value_t *val = jl_svec1(NULL);
+    JL_GC_PUSH1(&val);
+    jl_value_t *val2 = val;    
+    JL_GC_PUSH1(&val2);
+    JL_GC_POP();
+    jl_gc_safepoint();
+    look_at_value(val);
+    JL_GC_POP();
+}
+*/
+
+jl_module_t *propagation(jl_module_t *m PROPAGATES_ROOT);
+void module_member(jl_module_t *m)
+{
+    for(int i=(int)m->usings.len-1; i >= 0; --i) {
+      jl_module_t *imp = (jl_module_t*)m->usings.items[i];
+      jl_gc_safepoint();
+      look_at_value(imp);
+      jl_module_t *prop = propagation(imp);
+      look_at_value(prop);
+      JL_GC_PUSH1(&imp);
+      jl_gc_safepoint();
+      look_at_value(imp);
+      JL_GC_POP();
+    }
 }

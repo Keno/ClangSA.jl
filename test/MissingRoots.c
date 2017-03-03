@@ -1,8 +1,8 @@
 // RUN: %clang_cc1 -analyze -analyzer-checker=core,julia.gcpushpop -verify -x c++ %s
 
 #include "julia.h"
+#include "julia_internal.h"
 
-/*
 void unrooted_argument() {
     jl_(jl_svec1(NULL)); // expected-warning{{Passing non-rooted value as argument to function}}
                          // expected-note@-1{{Passing non-rooted value as argument to function}}
@@ -254,7 +254,6 @@ void scopes() {
     look_at_value(val);
     JL_GC_POP();
 }
-*/
 
 jl_module_t *propagation(jl_module_t *m PROPAGATES_ROOT);
 void module_member(jl_module_t *m)
@@ -270,4 +269,39 @@ void module_member(jl_module_t *m)
       look_at_value(imp);
       JL_GC_POP();
     }
+}
+
+extern jl_typemap_level_t *jl_new_typemap_level(void);
+static jl_typemap_level_t *jl_method_convert_list_to_cache(jl_typemap_entry_t *ml, jl_value_t *key, int8_t offs,
+                                                           const struct jl_typemap_info *tparams)
+{
+    jl_typemap_level_t *cache = jl_new_typemap_level();
+    cache->key = key;
+    jl_typemap_entry_t *next = NULL;
+    JL_GC_PUSH3(&cache, &next, &ml);
+    while (ml != (void*)jl_nothing) {
+        next = ml->next;
+        ml->next = (jl_typemap_entry_t*)jl_nothing;
+        jl_typemap_level_insert_(cache, ml, offs, tparams);
+        ml = next;
+    }
+    JL_GC_POP();
+    return cache;
+}
+
+int type_type(jl_value_t *v) {
+    return jl_is_type_type(jl_typeof(v));
+}
+
+void assoc_exact_broken(jl_value_t **args, size_t n, int8_t offs, size_t world) {
+    jl_typemap_level_t *cache = jl_new_typemap_level();
+    jl_typemap_assoc_exact(cache->any, args, n, offs, world); //expected-warning{{Passing non-rooted value as argument to function that may GC}}
+}
+
+extern jl_typemap_level_t *jl_new_typemap_level(void);
+void assoc_exact_ok(jl_value_t **args, size_t n, int8_t offs, size_t world) {
+    jl_typemap_level_t *cache = jl_new_typemap_level();
+    JL_GC_PUSH1(&cache);
+    jl_typemap_assoc_exact(cache->any, args, n, offs, world);
+    JL_GC_POP();
 }

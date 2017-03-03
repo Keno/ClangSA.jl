@@ -5,17 +5,17 @@ module ClangSA
     tok = join(rand('a':'z', 5))
     hack = """
       #undef JuliaAnalysisAction
-      #undef GCPushPopChecker
+      #undef GCChecker
       #undef GCDepth
       #undef GCDisabledAt
       #undef GCValueMap
       #undef GCValueMapTy
-      #undef registerGcPushPopChecker
+      #undef registerGCChecker
       #undef GCRootMap
       #undef GCRootMapTy
       #undef Helpers
       #define JuliaAnalysisAction JuliaAnalysisAction$tok
-      #define GCPushPopChecker GCPushPopChecker$tok
+      #define GCChecker GCChecker$tok
       #define GCDepth GCDepth$tok
       #define GCDisabledAt GCDisabledAt$tok
       #define GCValueMap GCValueMap$tok
@@ -23,7 +23,7 @@ module ClangSA
       #define GCRootMap GCRootMap$tok
       #define GCRootMapTy GCRootMap$(tok)Ty
       #define Helpers Helpers$(tok)
-      #define registerGcPushPopChecker registerGcPushPopChecker$tok
+      #define registerGCChecker registerGCChecker$tok
     """
     Cxx.cxxparse(hack)
 
@@ -70,7 +70,7 @@ module ClangSA
         }
     }
     void JuliaAnalysisAction::ExecuteAction() {
-        registerGcPushPopChecker(TheConsumer->GetCheckerManager());
+        registerGCChecker(TheConsumer->GetCheckerManager());
         registerNoReturnFunctionChecker(TheConsumer->GetCheckerManager());
         return this->ASTFrontendAction::ExecuteAction();
     }

@@ -74,6 +74,14 @@ namespace {
             static ValueState getFreed() { return ValueState(PotentiallyFreed, nullptr, -1); }
             static ValueState getUntracked() { return ValueState(Untracked, nullptr, -1); }
             static ValueState getRooted(const MemRegion *Root, int Depth) { return ValueState(Rooted, Root, Depth); }
+            static ValueState getForArgument(const FunctionDecl *FD,
+                                             const ParmVarDecl *PVD) {
+               bool isFunctionSafepoint = !isFDAnnotatedNotSafepoint(FD);
+               bool maybeUnrooted = declHasAnnotation(PVD, "julia_maybe_unrooted");
+               if (!isFunctionSafepoint || maybeUnrooted)
+                  return getAllocated();
+               return getRooted(nullptr, -1);
+            }
         };
         
         struct RootState {
@@ -125,7 +133,7 @@ namespace {
         bool isBundleOfGCValues(QualType QT) const;
         static void dumpState(const ProgramStateRef &State);
         static bool declHasAnnotation(const clang::Decl *D, const char *which);
-        bool isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) const;
+        static bool isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD);
         bool isSafepoint(const CallEvent &Call) const;
         bool processPotentialSafepoint(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
         bool processAllocationOfResult(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const;
@@ -318,7 +326,6 @@ PDP GCChecker::GCValueBugVisitor::ExplainNoPropagationFromExpr(const clang::Expr
         BR.addVisitor(llvm::make_unique<GCValueBugVisitor>(Parent));
         return MakePDP(Pos, "Root was not propagated due to a bug. Tracking base value.");      
     } else {
-        std::cout << "XXX " << Ex.Visit(Parent) << std::endl;
         BR.addVisitor(llvm::make_unique<GCValueBugVisitor>(Parent));
         return MakePDP(Pos, "No Root to propagate. Tracking.");
     }
@@ -478,7 +485,6 @@ bool GCChecker::propagateArgumentRootedness(CheckerContext &C, ProgramStateRef &
         }
         const ValueState *ValS = State->get<GCValueMap>(ArgSym);
         if (!ValS) {
-            std::cout << "Allocation was " << Ex.Visit(ArgSym) << std::endl;
             report_error([&](BugReport *Report) {
                 Report->addNote(
                   "Tried to find root for this parameter in inlined call",
@@ -489,7 +495,6 @@ bool GCChecker::propagateArgumentRootedness(CheckerContext &C, ProgramStateRef &
         auto Param = State->getLValue(P, LCtx);
         SymbolRef ParamSym = State->getSVal(Param).getAsSymbol();
         if (!ParamSym) {
-            std::cout << "Hello " << Ex.Visit(State->getSVal(Param)) << std::endl;
             continue;
         }
         if (isGloballyRootedType(P->getType())) {
@@ -526,23 +531,15 @@ void GCChecker::checkBeginFunction(CheckerContext &C) const {
             C.addTransition(State);
         return;
     }
-    bool isFunctionSafePoint = !isFDAnnotatedNotSafepoint(FD);
     SValExplainer Ex(C.getASTContext());
     for (const auto P : FD->parameters()) {
-        P->dump();
         if (isGCTrackedType(P->getType())) {
             auto Param = State->getLValue(P, LCtx);
             // TODO: Figure out the best way to do this
-            SymbolRef AssignedSym = State->getSVal(State->getSVal(Param).getAsRegion()).getAsSymbol();
+            SymbolRef AssignedSym = State->getSVal(Param).getAsSymbol();
             assert(AssignedSym);
-            std::cout << "Live " << Ex.Visit(Param) << std::endl;
-            std::cout << "Live 2" << Ex.Visit(AssignedSym) << std::endl;
-            if (isFunctionSafePoint) {
-                State = State->set<GCValueMap>(AssignedSym, ValueState::getRooted(nullptr, -1));
-            }
-            else {
-                State = State->set<GCValueMap>(AssignedSym, ValueState::getAllocated());
-            }
+            State = State->set<GCValueMap>(AssignedSym,
+                ValueState::getForArgument(FD, P));
             Change = true;
         }
     }
@@ -570,7 +567,7 @@ bool GCChecker::declHasAnnotation(const clang::Decl *D, const char *which) {
   return false;
 }
 
-bool GCChecker::isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) const {
+bool GCChecker::isFDAnnotatedNotSafepoint(const clang::FunctionDecl *FD) {
     return declHasAnnotation(FD, "julia_not_safepoint");
 }
 
@@ -670,7 +667,6 @@ const GCChecker::ValueState *GCChecker::getValStateForRegion(ASTContext &AstC,
         return nullptr;
     SValExplainer Ex(AstC);
     SymbolRef Sym = walkToRoot([&](SymbolRef Sym, const ValueState *OldVState) {
-      std::cout << "Hello " << Ex.Visit(Sym) << std::endl;
       return !OldVState || !OldVState->isRooted();
     },
         State, Region);
@@ -734,12 +730,8 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext 
         for (unsigned i = 0; i < FD->getNumParams(); ++i) {
             if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
                 SVal Test = Call.getArgSVal(i);
-                std::cout << "Arg SVAL is " << Ex.Visit(Test) << std::endl;
-                std::cout << "Arg Region is " << Ex.Visit(Test.getAsRegion()) << std::endl;
                 // Walk backwards to find the region that roots this value
-                const MemRegion *Region = State->getSVal(Test.getAsRegion()).getAsRegion();
-                if (Region)
-                    std::cout << "Trying to propagate from" << Ex.Visit(Region) << std::endl;
+                const MemRegion *Region = Test.getAsRegion();
                 const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
                 if (OldVState)
                     NewVState = *OldVState;
@@ -778,19 +770,15 @@ SymbolRef GCChecker::getSymbolForResult(const Expr *Result, const ValueState *Ol
       return nullptr;
   }
   SVal Loaded = State->getSVal(*ValLoc);
+  SValExplainer Ex(C.getASTContext());
   if (Loaded.isUnknown()) {
     QualType QT = Result->getType();
     if (OldValS || GCChecker::isGCTrackedType(QT)) {
-      std::cout << "Conjuring" << std::endl;
       Loaded = C.getSValBuilder().conjureSymbolVal(Result, C.getLocationContext(), QT,
                                             C.blockCount());
       State = State->bindLoc(*ValLoc, Loaded, C.getLocationContext());
     }
   }
-  const MemRegion *R = Loaded.getAsRegion();
-  if (!R)
-      return nullptr;
-  Loaded = State->getSVal(R);
   return Loaded.getAsSymbol();
 }
 
@@ -806,37 +794,32 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
     SVal ParentVal = C.getSVal(Parent);
     SymbolRef OldSym = ParentVal.getAsSymbol(true);
     const MemRegion *Region = C.getSVal(Parent).getAsRegion();
-    std::cout << "Region " << Ex.Visit(Region) << std::endl;
-    if (ParentIsLoc && Region) {
-        SVal OldVal = State->getSVal(Region);
-        std::cout << "OldVal " << Ex.Visit(OldVal) << std::endl;
-        /* This happens for structs and unions, so we try to find the underlying
-         * symbol that this derives from and check it for rootedness. */
-        if (auto LCV = OldVal.getAs<nonloc::LazyCompoundVal>()) {
-            const MemRegion *R = LCV->getRegion();
-            if (const FieldRegion *FR = R->getAs<FieldRegion>()) {
-                R = FR->getSuperRegion();
-                if (R) {
-                    OldSym = State->getSVal(R).getAsSymbol();
-                }
-            }
-        } else {
-            OldSym = OldVal.getAsSymbol(true);
-        }
-    }
-    if (OldSym)
-      std::cout << "Explain " << Ex.Visit(OldSym) << std::endl;
     const ValueState *OldValS = OldSym ? State->get<GCValueMap>(OldSym) : nullptr;
     SymbolRef NewSym = getSymbolForResult(Result, OldValS, State, C);
     if (!NewSym) {
         return;
     }
-    std::cout << "New Sym " << Ex.Visit(NewSym) << std::endl;
     if (Region) {
-      const VarRegion *VR = Helpers::walk_back_to_global_VR(Region);
-      if (VR && rootRegionIfGlobal(VR, State, C)) {
-          C.addTransition(State->set<GCValueMap>(NewSym, ValueState::getRooted(Region, -1)));
-          return;
+      const VarRegion *VR = Region->getAs<VarRegion>();
+      bool inheritedState = false;
+      ValueState NewValS = ValueState::getRooted(Region, -1);
+      if (VR && isa<ParmVarDecl>(VR->getDecl())) {  
+          // This works around us not being able to track symbols for struct/union
+          // parameters very well.
+          const auto *FD = dyn_cast<FunctionDecl>(C.getLocationContext()->getDecl());
+          if (FD) {
+            inheritedState = true; 
+            NewValS = ValueState::getForArgument(FD, cast<ParmVarDecl>(VR->getDecl()));
+          }
+      } else {
+        VR = Helpers::walk_back_to_global_VR(Region);
+        if (VR && rootRegionIfGlobal(VR, State, C)) {
+          inheritedState = true;
+        }
+      }
+      if (inheritedState) {
+        C.addTransition(State->set<GCValueMap>(NewSym, NewValS));
+        return;
       }
     }
     if (!OldValS) {
@@ -859,7 +842,6 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
 // Propagate rootedness through subscript
 void GCChecker::checkPostStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) const
 {
-    ASE->dump();
     // Could be a root array, in which case this should be considered rooted
     // by that array.
     const MemRegion *Region = C.getSVal(ASE->getLHS()).getAsRegion();
@@ -870,7 +852,6 @@ void GCChecker::checkPostStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) 
           Region->getAs<ElementRegion>()->getSuperRegion())) {
             ValueState ValS = ValueState::getRooted(Region, State->get<GCDepth>());
             SymbolRef NewSym = getSymbolForResult(ASE, &ValS, State, C);
-            std::cout << "Hello " << Ex.Visit(NewSym);
             if (!NewSym)
                 return;
             C.addTransition(C.getState()->set<GCValueMap>(NewSym, ValS));
@@ -882,7 +863,6 @@ void GCChecker::checkPostStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) 
 
 void GCChecker::checkPostStmt(const MemberExpr *ME, CheckerContext &C) const
 {
-    ME->dump();
     checkDerivingExpr(ME, ME->getBase(), true, C);
 }
 
@@ -902,11 +882,23 @@ void GCChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
     bool isCalleeSafepoint = isSafepoint(Call);
     auto *Decl = Call.getDecl();
     const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
+    SValExplainer Ex(C.getASTContext());
     if (!gcEnabledHere(C))
         return;
     for (unsigned idx = 0; idx < NumArgs; ++idx) {
         SVal Arg = Call.getArgSVal(idx);
         SymbolRef Sym = Arg.getAsSymbol();
+        // Hack to work around passing unions/structs by value.
+        if (auto LCV = Arg.getAs<nonloc::LazyCompoundVal>()) {
+          const MemRegion *R = LCV->getRegion();
+          if (R) {
+            if (const SubRegion *SR = R->getAs<SubRegion>()) {
+              if (const SymbolicRegion *SSR = SR->getSuperRegion()->getAs<SymbolicRegion>()) {
+                Sym = SSR->getSymbol();
+              }
+            }
+          }
+        }
         if (!Sym)
             continue;
         auto *ValState = State->get<GCValueMap>(Sym);
@@ -1009,7 +1001,6 @@ bool GCChecker::evalCall(const CallExpr *CE,
         }
         const MemRegion *Region = MRV->getRegion()->StripCasts();
         SValExplainer Ex(C.getASTContext());
-        std::cout << "Root array " << Ex.Visit(Region) << std::endl;
         State = State->set<GCRootMap>(Region, RootState::getRootArray(CurrentDepth));
         // The Argument array may also be used as a value, so make it rooted
         SymbolRef ArgArraySym = ArgArray.getAsSymbol();
@@ -1074,7 +1065,6 @@ void GCChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, CheckerCon
             C.addTransition(State);
             return;
         }
-        std::cout << "Symbol was " << Ex.Visit(Sym);
         report_value_error(C, Sym, "Saw assignment to root, but missed the allocation");
         return;
     }

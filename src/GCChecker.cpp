@@ -533,9 +533,14 @@ void GCChecker::checkBeginFunction(CheckerContext &C) const {
     }
     SValExplainer Ex(C.getASTContext());
     for (const auto P : FD->parameters()) {
-        if (isGCTrackedType(P->getType())) {
+        if (declHasAnnotation(P, "julia_require_rooted_slot")) {
             auto Param = State->getLValue(P, LCtx);
-            // TODO: Figure out the best way to do this
+            const MemRegion *Root = State->getSVal(Param).getAsRegion();
+            std::cout << "Rooted Slot " << Ex.Visit(Root) << std::endl;
+            State = State->set<GCRootMap>(Root,
+                RootState::getRoot(-1));
+        } else if (isGCTrackedType(P->getType())) {
+            auto Param = State->getLValue(P, LCtx);
             SymbolRef AssignedSym = State->getSVal(Param).getAsSymbol();
             assert(AssignedSym);
             State = State->set<GCValueMap>(AssignedSym,
@@ -602,6 +607,7 @@ bool GCChecker::isGCTrackedType(QualType QT) {
           Name.endswith_lower("jl_ordereddict_t") ||
           Name.endswith_lower("jl_typemap_t") ||
           Name.endswith_lower("jl_unionall_t") ||
+          Name.endswith_lower("jl_methtable_t") ||
           // Probably not technically true for these, but let's allow it
           Name.endswith_lower("typemap_intersection_env")
           ) {
@@ -648,10 +654,30 @@ bool GCChecker::processPotentialSafepoint(const CallEvent &Call, CheckerContext 
   SValExplainer Ex(C.getASTContext());
   if (!gcEnabledHere(C))
     return false;
+  const Decl *D = C.getLocationContext()->getDecl();
+  const FunctionDecl *FD = D ? D->getAsFunction() : nullptr;
+  SymbolRef SpeciallyRootedSymbol = nullptr;
+  if (FD) {
+    for (unsigned i = 0; i < FD->getNumParams(); ++i) {
+        if (declHasAnnotation(FD->getParamDecl(i), "julia_temporarily_roots")) {
+            SVal Test = Call.getArgSVal(i);
+            // Walk backwards to find the symbol that we're tracking for this
+            // value
+            const MemRegion *Region = Test.getAsRegion();
+            SpeciallyRootedSymbol = walkToRoot([&](SymbolRef Sym, const ValueState *OldVState) {
+              return !OldVState;
+            }, State, Region);
+            break;
+        }
+    }
+  }
+  
   // Symbolically free all unrooted values.
   GCValueMapTy AMap = State->get<GCValueMap>();
   for (auto I = AMap.begin(), E = AMap.end(); I != E; ++I) {
       if (I.getData().isJustAllocated()) {
+          if (SpeciallyRootedSymbol == I.getKey())
+              continue;
           State = State->set<GCValueMap>(I.getKey(), ValueState::getFreed());
           DidChange = true;
       }

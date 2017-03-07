@@ -608,6 +608,8 @@ bool GCChecker::isGCTrackedType(QualType QT) {
           Name.endswith_lower("jl_typemap_t") ||
           Name.endswith_lower("jl_unionall_t") ||
           Name.endswith_lower("jl_methtable_t") ||
+          Name.endswith_lower("jl_cgval_t") ||
+          Name.endswith_lower("jl_codectx_t") ||
           // Probably not technically true for these, but let's allow it
           Name.endswith_lower("typemap_intersection_env")
           ) {
@@ -726,6 +728,8 @@ bool GCChecker::processArgumentRooting(const CallEvent &Call, CheckerContext &C,
 }
 
 bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const {
+  if (!Call.getOriginExpr())
+      return false;
   QualType QT = Call.getResultType();
   if (!isGCTrackedType(QT))
       return false;
@@ -848,6 +852,10 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
         return;
       }
     }
+    // NewSym might already have a better root
+    const ValueState *NewValS = State->get<GCValueMap>(NewSym);
+    if (NewValS && NewValS->isRooted())
+        return;
     if (!OldValS) {
         // This way we'll get better diagnostics
         if (isGCTrackedType(Result->getType())) {
@@ -858,10 +866,7 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
     if (OldValS->isPotentiallyFreed())
         report_value_error(C, OldSym, "Creating derivative of value that may have been GCed");
     else {
-        // NewSym might already have a better root
-        const ValueState *NewValS = State->get<GCValueMap>(NewSym);
-        if (!NewValS || !NewValS->isRooted())
-            C.addTransition(State->set<GCValueMap>(NewSym, *OldValS));
+        C.addTransition(State->set<GCValueMap>(NewSym, *OldValS));
     }
 }
 
@@ -954,6 +959,7 @@ bool GCChecker::evalCall(const CallExpr *CE,
     // (globals should not be invalidated, etc), hence the use of evalCall.
     unsigned CurrentDepth = C.getState()->get<GCDepth>();
     auto name = C.getCalleeName(CE);
+    SValExplainer Ex(C.getASTContext());
     if (name == "JL_GC_POP") {
         if (CurrentDepth == 0) {
             report_error(C, "JL_GC_POP without corresponding push");
@@ -1026,7 +1032,6 @@ bool GCChecker::evalCall(const CallExpr *CE,
             return true;
         }
         const MemRegion *Region = MRV->getRegion()->StripCasts();
-        SValExplainer Ex(C.getASTContext());
         State = State->set<GCRootMap>(Region, RootState::getRootArray(CurrentDepth));
         // The Argument array may also be used as a value, so make it rooted
         SymbolRef ArgArraySym = ArgArray.getAsSymbol();

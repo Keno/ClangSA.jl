@@ -9,7 +9,7 @@
 # How to run on julia
 
 First, create a compilation database. The easiest way to do so is to use the
-`intercept-build` that comes with clang:
+`intercept-build` that comes with clang (in clang/tools/scan-build-py/bin):
 
 ```
 cd julia
@@ -25,6 +25,12 @@ paths = filter(path->(endswith(path,".c") || endswith(path,".cpp")),
 database = ClangSA.loadDatabase(srcdir)
 ClangSA.runTool(database, map(p->joinpath(srcdir, p), paths), ClangSA.getAnalysisAction())
 ```
+
+# Building as part of an LLVM build
+
+Simply symlink the GCChecker.cpp file from this package's `src/` directory into `clang/lib/StaticAnalyzer/Checkers`
+and add it to the CMakeLists.txt file in the same directory. You can then run
+`clang-check -analyze -p compilation_commands.json src/*{.c,.cpp}`
 
 # Development tips
 

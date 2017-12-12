@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -analyze -analyzer-checker=core,julia.gcpushpop -verify -x c++ %s
+// RUN: %clang --analyze -Xanalyzer -analyzer-output=text -Xclang -verify -I%julia_home/src -I%julia_home/src/support -I%julia_home/usr/include -Xclang -analyzer-checker=core,julia.GCChecker -x c++ %s
 
 #include "julia.h"
 
@@ -27,8 +27,9 @@ void jl_gc_run_finalizers_in_list(jl_ptls_t ptls, arraylist_t *list)
     size_t len = list->len;
     jl_value_t **items = (jl_value_t**)list->items;
     jl_gc_push_arraylist(ptls, list);
-    for (size_t i = 2;i < len;i += 2)
-        run_finalizer(ptls, items[i], items[i + 1]);
+    (void)len; (void)items;
+    //for (size_t i = 2;i < len;i += 2)
+    //    run_finalizer(ptls, items[i], items[i + 1]);
     JL_GC_POP();
 }
  

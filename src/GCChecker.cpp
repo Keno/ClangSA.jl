@@ -605,11 +605,12 @@ bool GCChecker::isGCTrackedType(QualType QT) {
           Name.endswith_lower("jl_tls_states_t") ||
           Name.endswith_lower("jl_binding_t") ||
           Name.endswith_lower("jl_ordereddict_t") ||
-          Name.endswith_lower("jl_typemap_t") ||
+          //Name.endswith_lower("jl_typemap_t") ||
           Name.endswith_lower("jl_unionall_t") ||
           Name.endswith_lower("jl_methtable_t") ||
           Name.endswith_lower("jl_cgval_t") ||
           Name.endswith_lower("jl_codectx_t") ||
+          Name.endswith_lower("jl_ast_context_t") ||
           // Probably not technically true for these, but let's allow it
           Name.endswith_lower("typemap_intersection_env")
           ) {
@@ -656,7 +657,7 @@ bool GCChecker::processPotentialSafepoint(const CallEvent &Call, CheckerContext 
   SValExplainer Ex(C.getASTContext());
   if (!gcEnabledHere(C))
     return false;
-  const Decl *D = C.getLocationContext()->getDecl();
+  const Decl *D = Call.getDecl();
   const FunctionDecl *FD = D ? D->getAsFunction() : nullptr;
   SymbolRef SpeciallyRootedSymbol = nullptr;
   if (FD) {
@@ -1034,9 +1035,9 @@ bool GCChecker::evalCall(const CallExpr *CE,
         const MemRegion *Region = MRV->getRegion()->StripCasts();
         State = State->set<GCRootMap>(Region, RootState::getRootArray(CurrentDepth));
         // The Argument array may also be used as a value, so make it rooted
-        SymbolRef ArgArraySym = ArgArray.getAsSymbol();
-        assert(ArgArraySym);
-        State = State->set<GCValueMap>(ArgArraySym, ValueState::getRooted(Region, CurrentDepth));
+        // SymbolRef ArgArraySym = ArgArray.getAsSymbol();
+        // assert(ArgArraySym);
+        // State = State->set<GCValueMap>(ArgArraySym, ValueState::getRooted(Region, CurrentDepth));
         CurrentDepth += 1;
         State = State->set<GCDepth>(CurrentDepth);
         C.addTransition(State);

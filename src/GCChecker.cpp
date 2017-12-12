@@ -758,18 +758,42 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext 
           return false; 
       if (declHasAnnotation(FD, "julia_globally_rooted")) {
           NewVState = ValueState::getRooted(nullptr, -1);
-      } else {  
-        for (unsigned i = 0; i < FD->getNumParams(); ++i) {
-            if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
-                SVal Test = Call.getArgSVal(i);
-                // Walk backwards to find the region that roots this value
-                const MemRegion *Region = Test.getAsRegion();
-                const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
-                if (OldVState)
-                    NewVState = *OldVState;
-                break;
+      } else {
+          // Special case for jl_box_ functions which have value-dependent
+          // global roots.
+          StringRef FDName = FD->getName();
+          if (FDName.startswith_lower("jl_box_")) {
+              SVal Arg = Call.getArgSVal(0);
+              if (auto CI = Arg.getAs<nonloc::ConcreteInt>()) {
+                  const llvm::APSInt &Value = CI->getValue();
+                  bool GloballyRooted = false;
+                  const int64_t NBOX_C = 1024;
+                  if (FDName.startswith_lower("jl_box_u")) {
+                      if (Value < NBOX_C) {
+                          GloballyRooted = true;
+                      }
+                  } else {
+                      if (-NBOX_C/2 < Value && Value < (NBOX_C - NBOX_C/2)) {
+                          GloballyRooted = true;
+                      }
+                  }
+                  if (GloballyRooted) {
+                      NewVState = ValueState::getRooted(nullptr, -1);
+                  }
+              }
+          } else {  
+            for (unsigned i = 0; i < FD->getNumParams(); ++i) {
+                if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
+                    SVal Test = Call.getArgSVal(i);
+                    // Walk backwards to find the region that roots this value
+                    const MemRegion *Region = Test.getAsRegion();
+                    const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
+                    if (OldVState)
+                        NewVState = *OldVState;
+                    break;
+                }
             }
-        }
+         }
       }
       State = State->set<GCValueMap>(Sym, NewVState);
   }

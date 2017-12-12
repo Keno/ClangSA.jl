@@ -10,6 +10,7 @@
 #include "clang/StaticAnalyzer/Core/BugReporter/CommonBugCategories.h"
 #include "clang/StaticAnalyzer/Frontend/AnalysisConsumer.h"
 #include "clang/StaticAnalyzer/Checkers/SValExplainer.h"
+#include "clang/StaticAnalyzer/Core/CheckerRegistry.h"
 #include <iostream>
 
 namespace {
@@ -1169,3 +1170,13 @@ void registerGCChecker(CheckerManager &mgr) {
 }
 }
 }
+
+#ifdef CLANG_PLUGIN
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+extern "C"
+void clang_registerCheckers (CheckerRegistry &registry) {
+  registry.addChecker<GCChecker>("julia.GCChecker",
+    "Validates julia gc invariants");
+}
+#endif

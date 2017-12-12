@@ -1,4 +1,4 @@
-// RUN: %clang --analyze -Xanalyzer -analyzer-output=text -Xclang -verify -I%julia_home/src -I%julia_home/src/support -I%julia_home/usr/include -Xclang -analyzer-checker=core,julia.GCChecker -x c++ %s
+// RUN: %clang --analyze -Xanalyzer -analyzer-output=text -Xclang -load -Xclang %gc_plugin -Xclang -verify -I%julia_home/src -I%julia_home/src/support -I%julia_home/usr/include -Xclang -analyzer-checker=core,julia.GCChecker -x c++ %s
 
 #include "julia.h"
 

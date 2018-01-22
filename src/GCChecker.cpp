@@ -280,8 +280,15 @@ PDP GCChecker::GCBugVisitor::VisitNode(
       PathDiagnosticLocation Pos(PathDiagnosticLocation::getStmt(N),
                            BRC.getSourceManager(),
                            N->getLocationContext());
-      // std::make_shared< in later LLVM
       return MakePDP(Pos, "GC frame changed here.");
+    }
+    unsigned NewGCState = N->getState()->get<GCDisabledAt>();
+    unsigned OldGCState = PrevN->getState()->get<GCDisabledAt>();
+    if (NewGCDepth != OldGCDepth) {
+      PathDiagnosticLocation Pos(PathDiagnosticLocation::getStmt(N),
+                           BRC.getSourceManager(),
+                           N->getLocationContext());
+      return MakePDP(Pos, "GC enabledness changed here.");
     }
     return nullptr;
 }
@@ -443,6 +450,7 @@ void GCChecker::report_value_error(CheckerContext &C, SymbolRef Sym, const char 
     auto Report = llvm::make_unique<BugReport>(*BT, message, N);
     Report->addVisitor(llvm::make_unique<GCValueBugVisitor>(Sym));
     Report->addVisitor(llvm::make_unique<GCBugVisitor>());
+    Report->addVisitor(llvm::make_unique<ConditionBRVisitor>());
     if (!range.isInvalid()) {
         Report->addRange(range);
     }
@@ -450,7 +458,7 @@ void GCChecker::report_value_error(CheckerContext &C, SymbolRef Sym, const char 
 }
 
 bool GCChecker::gcEnabledHere(CheckerContext &C) const {
-    int disabledAt = C.getState()->get<GCDisabledAt>();
+    unsigned disabledAt = C.getState()->get<GCDisabledAt>();
     return disabledAt == (unsigned)-1;
 }
 
@@ -606,6 +614,7 @@ bool GCChecker::isGCTrackedType(QualType QT) {
           Name.endswith_lower("jl_tls_states_t") ||
           Name.endswith_lower("jl_binding_t") ||
           Name.endswith_lower("jl_ordereddict_t") ||
+          Name.endswith_lower("jl_tvar_t") ||
           //Name.endswith_lower("jl_typemap_t") ||
           Name.endswith_lower("jl_unionall_t") ||
           Name.endswith_lower("jl_methtable_t") ||
@@ -613,7 +622,8 @@ bool GCChecker::isGCTrackedType(QualType QT) {
           Name.endswith_lower("jl_codectx_t") ||
           Name.endswith_lower("jl_ast_context_t") ||
           // Probably not technically true for these, but let's allow it
-          Name.endswith_lower("typemap_intersection_env")
+          Name.endswith_lower("typemap_intersection_env") ||
+          Name.endswith_lower("interpreter_state")
           ) {
           return true;
       }
@@ -730,15 +740,20 @@ bool GCChecker::processArgumentRooting(const CallEvent &Call, CheckerContext &C,
 }
 
 bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext &C, ProgramStateRef &State) const {
-  if (!Call.getOriginExpr())
-      return false;
   QualType QT = Call.getResultType();
   if (!isGCTrackedType(QT))
-      return false;
+    return false;
+  if (!Call.getOriginExpr()) {
+    return false;
+  }
   SymbolRef Sym = Call.getReturnValue().getAsSymbol();
   SValExplainer Ex(C.getASTContext());
-  if (!Sym)
-      return false;
+  if (!Sym) {
+    SVal S = C.getSValBuilder().conjureSymbolVal(Call.getOriginExpr(),
+      C.getLocationContext(), QT, C.blockCount());
+    State = State->BindExpr(Call.getOriginExpr(), C.getLocationContext(), S);
+    Sym = S.getAsSymbol();
+  }
   if (isGloballyRootedType(QT))
       State = State->set<GCValueMap>(Sym, ValueState::getRooted(nullptr, -1));
   else {
@@ -748,52 +763,53 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext 
           // If the call was inlined, we may have accidentally killed the return
           // value above. Revive it here.
           const ValueState *PrevValState = C.getState()->get<GCValueMap>(Sym);
-          if (!ValS->isPotentiallyFreed() || (PrevValState && PrevValState->isPotentiallyFreed()))
+          if (!ValS->isPotentiallyFreed() || (PrevValState && PrevValState->isPotentiallyFreed())) {
               return false;
+          }
           NewVState = *PrevValState;
       }
       auto *Decl = Call.getDecl();
       const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
-      if (!FD)
-          return false; 
-      if (declHasAnnotation(FD, "julia_globally_rooted")) {
-          NewVState = ValueState::getRooted(nullptr, -1);
-      } else {
-          // Special case for jl_box_ functions which have value-dependent
-          // global roots.
-          StringRef FDName = FD->getName();
-          if (FDName.startswith_lower("jl_box_")) {
-              SVal Arg = Call.getArgSVal(0);
-              if (auto CI = Arg.getAs<nonloc::ConcreteInt>()) {
-                  const llvm::APSInt &Value = CI->getValue();
-                  bool GloballyRooted = false;
-                  const int64_t NBOX_C = 1024;
-                  if (FDName.startswith_lower("jl_box_u")) {
-                      if (Value < NBOX_C) {
-                          GloballyRooted = true;
+      if (FD) {
+          if (declHasAnnotation(FD, "julia_globally_rooted")) {
+              NewVState = ValueState::getRooted(nullptr, -1);
+          } else {
+              // Special case for jl_box_ functions which have value-dependent
+              // global roots.
+              StringRef FDName = FD->getName();
+              if (FDName.startswith_lower("jl_box_")) {
+                  SVal Arg = Call.getArgSVal(0);
+                  if (auto CI = Arg.getAs<nonloc::ConcreteInt>()) {
+                      const llvm::APSInt &Value = CI->getValue();
+                      bool GloballyRooted = false;
+                      const int64_t NBOX_C = 1024;
+                      if (FDName.startswith_lower("jl_box_u")) {
+                          if (Value < NBOX_C) {
+                              GloballyRooted = true;
+                          }
+                      } else {
+                          if (-NBOX_C/2 < Value && Value < (NBOX_C - NBOX_C/2)) {
+                              GloballyRooted = true;
+                          }
                       }
-                  } else {
-                      if (-NBOX_C/2 < Value && Value < (NBOX_C - NBOX_C/2)) {
-                          GloballyRooted = true;
+                      if (GloballyRooted) {
+                          NewVState = ValueState::getRooted(nullptr, -1);
                       }
                   }
-                  if (GloballyRooted) {
-                      NewVState = ValueState::getRooted(nullptr, -1);
-                  }
-              }
-          } else {  
-            for (unsigned i = 0; i < FD->getNumParams(); ++i) {
-                if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
-                    SVal Test = Call.getArgSVal(i);
-                    // Walk backwards to find the region that roots this value
-                    const MemRegion *Region = Test.getAsRegion();
-                    const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
-                    if (OldVState)
-                        NewVState = *OldVState;
-                    break;
+              } else {  
+                for (unsigned i = 0; i < FD->getNumParams(); ++i) {
+                    if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
+                        SVal Test = Call.getArgSVal(i);
+                        // Walk backwards to find the region that roots this value
+                        const MemRegion *Region = Test.getAsRegion();
+                        const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
+                        if (OldVState)
+                            NewVState = *OldVState;
+                        break;
+                    }
                 }
-            }
-         }
+             }
+          }
       }
       State = State->set<GCValueMap>(Sym, NewVState);
   }
@@ -942,6 +958,8 @@ void GCChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
     SValExplainer Ex(C.getASTContext());
     if (!gcEnabledHere(C))
         return;
+    if (FD && FD->getName() == "JL_GC_PROMISE_ROOTED")
+        return;
     for (unsigned idx = 0; idx < NumArgs; ++idx) {
         SVal Arg = Call.getArgSVal(idx);
         SymbolRef Sym = Arg.getAsSymbol();
@@ -970,8 +988,9 @@ void GCChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
             continue;
         bool MaybeUnrooted = false;
         if (FD) {
-            if (idx < FD->getNumParams())
+            if (idx < FD->getNumParams()) {
                 MaybeUnrooted = declHasAnnotation(FD->getParamDecl(idx), "julia_maybe_unrooted");
+            }
         }
         if (!MaybeUnrooted && isCalleeSafepoint) {
             report_value_error(C, Sym, "Passing non-rooted value as argument to function that may GC", range);
@@ -1078,7 +1097,34 @@ bool GCChecker::evalCall(const CallExpr *CE,
         return true;
     } else if (name == "jl_gc_push_arraylist") {
         CurrentDepth += 1;
-        C.addTransition(C.getState()->set<GCDepth>(CurrentDepth));
+        ProgramStateRef State = C.getState()->set<GCDepth>(CurrentDepth);
+        SVal ArrayList = C.getSVal(CE->getArg(1));
+        // Try to find the items field
+        FieldDecl *FD = NULL;
+        RecordDecl *RD = dyn_cast_or_null<RecordDecl>(CE->getArg(1)->getType()->getPointeeType()->getAsTagDecl());
+        if (RD) {
+            for (FieldDecl *X : RD->fields()) {
+                if (X->getName() == "items") {
+                    FD = X;
+                    break;
+                }
+            }
+        }
+        if (FD) {
+            Loc ItemsLoc = State->getLValue(FD, ArrayList).getAs<Loc>().getValue();
+            SVal Items = State->getSVal(ItemsLoc);
+            if (Items.isUnknown()) {
+                Items = C.getSValBuilder().conjureSymbolVal(CE,
+                    C.getLocationContext(), FD->getType(),
+                    C.blockCount());
+                State = State->bindLoc(ItemsLoc, Items, C.getLocationContext());
+            }
+            assert(Items.getAsRegion());
+            // The items list is now rooted 
+            State = State->set<GCRootMap>(Items.getAsRegion(),
+                RootState::getRootArray(CurrentDepth));
+        }
+        C.addTransition(State);
         return true;
     } else if (name == "jl_ast_preserve") {
         // TODO: Maybe bind the rooting to the context. For now, the second
@@ -1088,6 +1134,29 @@ bool GCChecker::evalCall(const CallExpr *CE,
         if (!Sym)
           return true;
         C.addTransition(State->set<GCValueMap>(Sym, ValueState::getRooted(nullptr, -1)));
+        return true;
+    } else if (name == "jl_gc_enable") {
+        ProgramStateRef State = C.getState();
+        // Check for a literal argument
+        SVal Arg = C.getSVal(CE->getArg(0));
+        auto CI = Arg.getAs<nonloc::ConcreteInt>();
+        bool EnabledAfter = true;
+        if (CI) {
+            const llvm::APSInt &Val = CI->getValue();
+            EnabledAfter = Val != 0;  
+        } else {
+            cast<SymbolConjured>(Arg.getAsSymbol())->getStmt()->dump();
+        }
+        bool EnabledNow = State->get<GCDisabledAt>() == (unsigned)-1;
+        if (!EnabledAfter) {
+            State = State->set<GCDisabledAt>((unsigned)-2);
+        } else {
+            State = State->set<GCDisabledAt>((unsigned)-1);
+        }
+        // GC State is explicitly modeled, so let's make sure
+        // the execution matches our model
+        SVal Result = C.getSValBuilder().makeTruthVal(EnabledNow, CE->getType());
+        C.addTransition(State->BindExpr(CE, C.getLocationContext(), Result));
         return true;
     }
     return false;
@@ -1121,6 +1190,10 @@ void GCChecker::checkBind(SVal LVal, SVal RVal, const clang::Stmt *S, CheckerCon
         if (rootRegionIfGlobal(Sym->getOriginRegion(), State, C)) {
             C.addTransition(State);
             return;
+        }
+        Sym->dump();
+        if (auto *SC = cast<SymbolConjured>(Sym)) {
+            SC->getStmt()->dump();
         }
         report_value_error(C, Sym, "Saw assignment to root, but missed the allocation");
         return;

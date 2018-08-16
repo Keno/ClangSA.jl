@@ -32,6 +32,20 @@ Simply symlink the GCChecker.cpp file from this package's `src/` directory into 
 and add it to the CMakeLists.txt file in the same directory. You can then run
 `clang-check -extra-arg="-Xanalyzer" -extra-arg="-analyzer-checker=julia.GCChecker" -analyze src/*{.c,.cpp}`
 
+You will also need to add the following at the end of include/clang/StaticAnalyzer/Checkers/Checkers.td:
+```
+ //===----------------------------------------------------------------------===//
+ // Julia Checkers
+ //===----------------------------------------------------------------------===//
+ def Julia : Package<"julia">;
+ let ParentPackage = Julia in {
+
+ def GCChecker : Checker<"GCChecker">,
+    HelpText<"Checks invariants of the Julia GC API.">,
+    DescFile<"GCChecker.cpp">;
+ } // end "julia"
+ ```
+
 # Development tips
 
 This package is designed for rapid iteration. The package can be `reload`ed, and

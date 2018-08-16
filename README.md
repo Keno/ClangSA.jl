@@ -30,7 +30,7 @@ ClangSA.runTool(database, map(p->joinpath(srcdir, p), paths), ClangSA.getAnalysi
 
 Simply symlink the GCChecker.cpp file from this package's `src/` directory into `clang/lib/StaticAnalyzer/Checkers`
 and add it to the CMakeLists.txt file in the same directory. You can then run
-`clang-check -extra-arg="-Xanalyzer" -extra-arg="-analyzer-checker=julia.GCChecker" -analyze src/*{.c,.cpp}`
+`clang-check -extra-arg="-Xanalyzer" -extra-arg="-analyzer-checker=julia.GCChecker" -extra-arg -Xclang -extra-arg -analyzer-output=text -analyze src/*{.c,.cpp}`
 
 You will also need to add the following at the end of include/clang/StaticAnalyzer/Checkers/Checkers.td:
 ```

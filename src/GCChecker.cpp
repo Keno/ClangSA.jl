@@ -16,15 +16,10 @@
 namespace {
     using namespace clang;
     using namespace ento;
-  
-#if LLVM_VERSION_MAJOR >= 4
+
     #define PDP std::shared_ptr<PathDiagnosticPiece>
     #define MakePDP llvm::make_unique<PathDiagnosticEventPiece>
-#else
-    #define PDP clang::ento::PathDiagnosticPiece * 
-    #define MakePDP new clang::ento::PathDiagnosticEventPiece
-#endif        
-  
+
     class GCChecker : public Checker<eval::Call,
                                             check::BeginFunction,
                                             check::EndFunction,
@@ -147,7 +142,7 @@ namespace {
         
     public:
         void checkBeginFunction(CheckerContext &Ctx) const;
-        void checkEndFunction(CheckerContext &Ctx) const;
+        void checkEndFunction(const clang::ReturnStmt* RS, CheckerContext &Ctx) const;
         bool evalCall(const CallExpr *CE, CheckerContext &C) const;
         void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
         void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
@@ -158,7 +153,7 @@ namespace {
         void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
         void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &) const;
         class GCBugVisitor
-          : public BugReporterVisitorImpl<GCBugVisitor> {
+          : public BugReporterVisitor {
         public:
           GCBugVisitor() {}
 
@@ -168,16 +163,16 @@ namespace {
           }
 
           PDP VisitNode(const ExplodedNode *N,
-                                                         const ExplodedNode *PrevN,
-                                                         BugReporterContext &BRC,
-                                                         BugReport &BR) override;
+                        const ExplodedNode *PrevN,
+                        BugReporterContext &BRC,
+                        BugReport &BR) override;
         };
-        
+
         class GCValueBugVisitor
-          : public BugReporterVisitorImpl<GCValueBugVisitor> {
+          : public BugReporterVisitor {
         protected:
           SymbolRef Sym;
-            
+
         public:
           GCValueBugVisitor(SymbolRef S) : Sym(S) {}
 
@@ -284,7 +279,7 @@ PDP GCChecker::GCBugVisitor::VisitNode(
     }
     unsigned NewGCState = N->getState()->get<GCDisabledAt>();
     unsigned OldGCState = PrevN->getState()->get<GCDisabledAt>();
-    if (NewGCDepth != OldGCDepth) {
+    if (false /*NewGCState != OldGCState*/) {
       PathDiagnosticLocation Pos(PathDiagnosticLocation::getStmt(N),
                            BRC.getSourceManager(),
                            N->getLocationContext());
@@ -443,7 +438,7 @@ void GCChecker::report_value_error(CheckerContext &C, SymbolRef Sym, const char 
     ExplodedNode *N = C.generateErrorNode();
     if (!N)
       return;
-  
+
     if (!BT)
         BT.reset(new BugType(this, "Invalid GC thingy",
                            categories::LogicError));
@@ -562,7 +557,7 @@ void GCChecker::checkBeginFunction(CheckerContext &C) const {
     }
 }
 
-void GCChecker::checkEndFunction(CheckerContext &C) const {
+void GCChecker::checkEndFunction(const clang::ReturnStmt* RS, CheckerContext &C) const {
     if (!C.inTopFrame())
         return;
     if (C.getState()->get<GCDepth>() > 0) {
@@ -1037,7 +1032,8 @@ bool GCChecker::evalCall(const CallExpr *CE,
                name == "JL_GC_PUSH2" ||
                name == "JL_GC_PUSH3" ||
                name == "JL_GC_PUSH4" ||
-               name == "JL_GC_PUSH5") {
+               name == "JL_GC_PUSH5" ||
+               name == "JL_GC_PUSH6") {
         ProgramStateRef State = C.getState();
         // Transform slots to roots, transform values to rooted
         unsigned NumArgs = CE->getNumArgs();

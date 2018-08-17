@@ -105,7 +105,7 @@ int pushargs_roots_freed() {
                            // expected-note@-1{{Creating derivative of value that may have been GCed}}
 }
 
-extern void process_unrooted(jl_value_t *maybe_unrooted MAYBE_UNROOTED);
+extern void process_unrooted(jl_value_t *maybe_unrooted JL_MAYBE_UNROOTED);
 int unrooted() {
   jl_svec_t *val = jl_svec1(NULL);
   // This is ok
@@ -115,7 +115,7 @@ int unrooted() {
                            // expected-note@-1{{Creating derivative of value that may have been GCed}}
 }
 
-extern jl_value_t *global_value GLOBALLY_ROOTED; 
+extern jl_value_t *global_value JL_GLOBALLY_ROOTED; 
 extern void look_at_value(jl_value_t *v);
 void globally_rooted() {
   jl_value_t *val = global_value;
@@ -129,7 +129,7 @@ void globally_rooted() {
   look_at_value(val);
 }
 
-extern jl_value_t *first_array_elem(jl_array_t *a PROPAGATES_ROOT);
+extern jl_value_t *first_array_elem(jl_array_t *a JL_PROPAGATES_ROOT);
 void root_propagation(jl_expr_t *expr) {
   jl_value_t *val = first_array_elem(expr->args);
   jl_gc_safepoint();
@@ -188,7 +188,7 @@ void pushargs_as_args()
   JL_GC_POP();
 }
 
-static jl_typemap_entry_t *call_cache[10] GLOBALLY_ROOTED;
+static jl_typemap_entry_t *call_cache[10] JL_GLOBALLY_ROOTED;
 void global_array2() {
   jl_value_t *val = NULL;
   JL_GC_PUSH1(&val);
@@ -226,12 +226,12 @@ void tparam0(jl_value_t *atype) {
    look_at_value(jl_tparam0(atype));
 }
 
-extern jl_value_t *global_atype GLOBALLY_ROOTED;
+extern jl_value_t *global_atype JL_GLOBALLY_ROOTED;
 void tparam0_global() {
    look_at_value(jl_tparam0(global_atype));
 }
 
-static jl_value_t *some_global GLOBALLY_ROOTED;
+static jl_value_t *some_global JL_GLOBALLY_ROOTED;
 void global_copy() {
     jl_value_t *local = NULL;
     jl_gc_safepoint();
@@ -255,7 +255,7 @@ void scopes() {
     JL_GC_POP();
 }
 
-jl_module_t *propagation(jl_module_t *m PROPAGATES_ROOT);
+jl_module_t *propagation(jl_module_t *m JL_PROPAGATES_ROOT);
 void module_member(jl_module_t *m)
 {
     for(int i=(int)m->usings.len-1; i >= 0; --i) {

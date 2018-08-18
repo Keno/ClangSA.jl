@@ -540,7 +540,6 @@ void GCChecker::checkBeginFunction(CheckerContext &C) const {
         if (declHasAnnotation(P, "julia_require_rooted_slot")) {
             auto Param = State->getLValue(P, LCtx);
             const MemRegion *Root = State->getSVal(Param).getAsRegion();
-            std::cout << "Rooted Slot " << Ex.Visit(Root) << std::endl;
             State = State->set<GCRootMap>(Root,
                 RootState::getRoot(-1));
         } else if (isGCTrackedType(P->getType())) {
@@ -791,7 +790,7 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext 
                           NewVState = ValueState::getRooted(nullptr, -1);
                       }
                   }
-              } else {  
+              } else {
                 for (unsigned i = 0; i < FD->getNumParams(); ++i) {
                     if (declHasAnnotation(FD->getParamDecl(i), "julia_propagates_root")) {
                         SVal Test = Call.getArgSVal(i);
@@ -851,6 +850,19 @@ SymbolRef GCChecker::getSymbolForResult(const Expr *Result, const ValueState *Ol
 
 void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool ParentIsLoc, CheckerContext &C) const
 {
+    bool ResultTracked = true;
+    if (!isGCTrackedType(Result->getType())) {
+        // TODO: We may want to refine this. This is to track pointers through the array list
+        // in jl_module_t.
+        bool ParentIsModule = isJuliaType([](StringRef Name) {
+          return Name.endswith_lower("jl_module_t"); }, Parent->getType());
+        bool ResultIsArrayList = isJuliaType([](StringRef Name) {
+          return Name.endswith_lower("arraylist_t"); }, Result->getType());
+        if (!(ParentIsModule && ResultIsArrayList) &&
+            isGCTrackedType(Parent->getType())) {
+          ResultTracked = false;
+        }
+    }
     // This is the pointer
     SValExplainer Ex(C.getASTContext());
     auto ValLoc = C.getSVal(Result).getAs<Loc>();
@@ -870,12 +882,12 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
       const VarRegion *VR = Region->getAs<VarRegion>();
       bool inheritedState = false;
       ValueState NewValS = ValueState::getRooted(Region, -1);
-      if (VR && isa<ParmVarDecl>(VR->getDecl())) {  
+      if (VR && isa<ParmVarDecl>(VR->getDecl())) {
           // This works around us not being able to track symbols for struct/union
           // parameters very well.
           const auto *FD = dyn_cast<FunctionDecl>(C.getLocationContext()->getDecl());
           if (FD) {
-            inheritedState = true; 
+            inheritedState = true;
             NewValS = ValueState::getForArgument(FD, cast<ParmVarDecl>(VR->getDecl()));
           }
       } else {
@@ -884,7 +896,7 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
           inheritedState = true;
         }
       }
-      if (inheritedState) {
+      if (inheritedState && ResultTracked) {
         C.addTransition(State->set<GCValueMap>(NewSym, NewValS));
         return;
       }
@@ -902,7 +914,7 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
     }
     if (OldValS->isPotentiallyFreed())
         report_value_error(C, OldSym, "Creating derivative of value that may have been GCed");
-    else {
+    else if (ResultTracked) {
         C.addTransition(State->set<GCValueMap>(NewSym, *OldValS));
     }
 }
@@ -1081,7 +1093,7 @@ bool GCChecker::evalCall(const CallExpr *CE,
         CurrentDepth += 1;
         State = State->set<GCDepth>(CurrentDepth);
         C.addTransition(State);
-        return true; 
+        return true;
     } else if (name == "JL_GC_PROMISE_ROOTED") {
         SVal Arg = C.getSVal(CE->getArg(0));
         SymbolRef Sym = Arg.getAsSymbol();

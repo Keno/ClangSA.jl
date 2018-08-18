@@ -51,3 +51,10 @@ void module_member(jl_module_t *m)
       JL_GC_POP();
     }
 }
+
+jl_value_t *alloc_something();
+jl_value_t *boxed_something() {
+  jl_value_t *val = alloc_something();
+  return jl_box_long(jl_datatype_size(val));
+}
+

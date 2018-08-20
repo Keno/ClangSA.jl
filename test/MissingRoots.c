@@ -297,3 +297,52 @@ void box_special_cases1(int i) {
 void box_special_cases2() {
     jl_(jl_box_long(0));
 }
+
+jl_value_t *alloc_something();
+jl_value_t *boxed_something() {
+  jl_value_t *val = alloc_something();
+  return jl_box_long(jl_datatype_size(val));
+}
+
+jl_value_t *alloc_something();
+void out_arg(jl_value_t **out JL_REQUIRE_ROOTED_SLOT)
+{
+    jl_value_t *val = alloc_something();
+    JL_GC_PUSH1(&val);
+    *out = val;
+    JL_GC_POP();
+}
+
+void foo_out_arg()
+{
+    jl_value_t *val_slot = NULL;
+    JL_GC_PUSH1(&val_slot);
+    out_arg(&val_slot);
+    look_at_value(val_slot);
+    JL_GC_POP();
+}
+
+typedef struct _varbinding {
+    jl_tvar_t *var;
+    jl_value_t *lb;
+    jl_value_t *ub;
+} jl_varbinding_t;
+
+extern void look_at_value(jl_value_t *v);
+extern void escape_vb(jl_varbinding_t **vb);
+void stack_rooted(jl_value_t *lb JL_MAYBE_UNROOTED, jl_value_t *ub JL_MAYBE_UNROOTED) {
+    jl_varbinding_t vb = { NULL, lb, ub };
+    JL_GC_PUSH2(&vb.lb, &vb.ub);
+    escape_vb(&vb);
+    look_at_value(vb.lb);
+    JL_GC_POP();
+}
+
+extern void look_at_value(jl_value_t *v);
+void JL_NORETURN throw_internal(jl_value_t *e JL_MAYBE_UNROOTED)
+{
+    jl_ptls_t ptls = jl_get_ptls_states();
+    ptls->exception_in_transit = e;
+    jl_gc_unsafe_enter(ptls);
+    look_at_value(e);
+}

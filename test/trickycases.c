@@ -3,58 +3,107 @@
 #include "julia.h"
 #include "julia_internal.h"
 
-void member_expr2(jl_typemap_entry_t *tm) {
-  jl_value_t *val = NULL;
-  JL_GC_PUSH1(&val);
-  val = tm->func.linfo;
-  JL_GC_POP();
-}
-
-void clang_analyzer_explain(void *) JL_NOTSAFEPOINT;
 extern void look_at_value(jl_value_t *v);
+extern void jl_gc_safepoint();
 
-static inline void look_at_args(jl_value_t **args) {
-  look_at_value(args[1]);
-  jl_value_t *val = NULL;
-  JL_GC_PUSH1(&val);
-  val = args[2];
-  JL_GC_POP();
-}
-
-void pushargs_as_args()
+// this is the general entry point for looking up a type in the cache
+// as a subtype, or with type_equal
+jl_typemap_entry_t *jl_typemap_assoc_by_type(union jl_typemap_t ml_or_cache, jl_value_t *types, jl_svec_t **penv,
+                                             int8_t subtype, int8_t offs, size_t world, size_t max_world_mask)
 {
-  jl_value_t **args;
-  JL_GC_PUSHARGS(args, 5);
-  look_at_args(args);
-  JL_GC_POP();
-}
-
-extern jl_value_t *first_array_elem(jl_array_t *a JL_PROPAGATES_ROOT);
-void root_propagation(jl_expr_t *expr) {
-  jl_value_t *val = first_array_elem(expr->args);
-  jl_gc_safepoint();
-  look_at_value(val);
-}
-
-jl_module_t *propagation(jl_module_t *m JL_PROPAGATES_ROOT);
-void module_member(jl_module_t *m)
-{
-    for(int i=(int)m->usings.len-1; i >= 0; --i) {
-      jl_module_t *imp = (jl_module_t*)m->usings.items[i];
-      jl_gc_safepoint();
-      look_at_value(imp);
-      jl_module_t *prop = propagation(imp);
-      look_at_value(prop);
-      JL_GC_PUSH1(&imp);
-      jl_gc_safepoint();
-      look_at_value(imp);
-      JL_GC_POP();
+    if (jl_typeof(ml_or_cache.unknown) == (jl_value_t*)jl_typemap_level_type) {
+        jl_typemap_level_t *cache = ml_or_cache.node;
+        // called object is the primary key for constructors, otherwise first argument
+        jl_value_t *ty = NULL;
+        jl_value_t *ttypes = jl_unwrap_unionall((jl_value_t*)types);
+        assert(jl_is_datatype(ttypes));
+        size_t l = jl_field_count(ttypes);
+        int isva = 0;
+        // compute the type at offset `offs` into `types`, which may be a Vararg
+        if (l <= offs + 1) {
+            ty = jl_tparam(ttypes, l - 1);
+            if (jl_is_vararg_type(ty)) {
+                ty = jl_unwrap_vararg(ty);
+                isva = 1;
+            }
+            else if (l <= offs) {
+                ty = NULL;
+            }
+        }
+        else if (l > offs) {
+            ty = jl_tparam(ttypes, offs);
+        }
+        // If there is a type at offs, look in the optimized caches
+        if (!subtype) {
+            if (ty && jl_is_any(ty))
+                return jl_typemap_assoc_by_type(cache->any, types, penv, subtype, offs + 1, world, max_world_mask);
+            if (isva) // in lookup mode, want to match Vararg exactly, not as a subtype
+                ty = NULL;
+        }
+        if (ty) {
+            if (jl_is_type_type(ty)) {
+                jl_value_t *a0 = jl_tparam0(ty);
+                if (cache->targ.values != (void*)jl_nothing && jl_is_datatype(a0)) {
+                    union jl_typemap_t ml = mtcache_hash_lookup(&cache->targ, a0, 1, offs);
+                    if (ml.unknown != jl_nothing) {
+                        jl_typemap_entry_t *li =
+                            jl_typemap_assoc_by_type(ml, types, penv, subtype, offs + 1, world, max_world_mask);
+                        if (li) return li;
+                    }
+                }
+                if (!subtype && is_cache_leaf(a0)) return NULL;
+            }
+            if (cache->arg1.values != (void*)jl_nothing && jl_is_datatype(ty)) {
+                union jl_typemap_t ml = mtcache_hash_lookup(&cache->arg1, ty, 0, offs);
+                if (ml.unknown != jl_nothing) {
+                    jl_typemap_entry_t *li =
+                        jl_typemap_assoc_by_type(ml, types, penv, subtype, offs + 1, world, max_world_mask);
+                    if (li) return li;
+                }
+            }
+            if (!subtype && is_cache_leaf(ty)) return NULL;
+        }
+        // Always check the list (since offs doesn't always start at 0)
+        if (subtype) {
+            jl_typemap_entry_t *li = jl_typemap_assoc_by_type_(cache->linear, types, penv, world, max_world_mask);
+            if (li) return li;
+            return jl_typemap_assoc_by_type(cache->any, types, penv, subtype, offs + 1, world, max_world_mask);
+        }
+        else {
+            return jl_typemap_lookup_by_type_(cache->linear, types, world, max_world_mask);
+        }
+    }
+    else {
+        return subtype ?
+            jl_typemap_assoc_by_type_(ml_or_cache.leaf, types, penv, world, max_world_mask) :
+            jl_typemap_lookup_by_type_(ml_or_cache.leaf, types, world, max_world_mask);
     }
 }
 
-jl_value_t *alloc_something();
-jl_value_t *boxed_something() {
-  jl_value_t *val = alloc_something();
-  return jl_box_long(jl_datatype_size(val));
-}
+jl_typemap_entry_t *jl_typemap_insert(union jl_typemap_t *cache, jl_value_t *parent,
+                                      jl_tupletype_t *type,
+                                      jl_tupletype_t *simpletype, jl_svec_t *guardsigs,
+                                      jl_value_t *newvalue, int8_t offs,
+                                      const struct jl_typemap_info *tparams,
+                                      size_t min_world, size_t max_world,
+                                      jl_value_t **overwritten)
+{
+    jl_ptls_t ptls = jl_get_ptls_states();
+    assert(min_world > 0 && max_world > 0);
+    if (!simpletype)
+        simpletype = (jl_tupletype_t*)jl_nothing;
+    jl_value_t *ttype = jl_unwrap_unionall((jl_value_t*)type);
 
+    if ((jl_value_t*)simpletype == jl_nothing) {
+        jl_typemap_entry_t *ml = jl_typemap_assoc_by_type(*cache, (jl_value_t*)type, NULL, 0, offs, min_world, 0);
+        if (ml && ml->simplesig == (void*)jl_nothing) {
+            if (overwritten != NULL)
+                *overwritten = ml->func.value;
+            if (newvalue == ml->func.value) // no change. TODO: involve world in computation!
+                return ml;
+            if (newvalue == NULL)  // don't overwrite with guard entries
+                return ml;
+            ml->max_world = min_world - 1;
+        }
+    }
+}

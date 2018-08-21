@@ -138,7 +138,6 @@ namespace {
         static SymbolRef walkToRoot(callback f, const ProgramStateRef &State, const MemRegion *Region);
         
         static bool isGCTrackedType(QualType Type);
-        static bool isTypeMapType(QualType Type);
         bool isGloballyRootedType(QualType Type) const;
         bool isBundleOfGCValues(QualType QT) const;
         static void dumpState(const ProgramStateRef &State);
@@ -276,32 +275,6 @@ namespace Helpers {
         if (!SR)
             break;
         Region = SR->getSuperRegion();
-    }
-    return nullptr;
-  }
-
-  static const SymbolRef walk_back_to_Sym(const MemRegion *Region) {
-    // This is here for jl_typemap_t unions. Is it correct? I have no idea, but it
-    // seems to work.
-    while (true) {
-      const SymbolicRegion *SymR = Region->getAs<SymbolicRegion>();
-      if (SymR) {
-          const SymbolRegionValue *SymRV = dyn_cast<SymbolRegionValue>(SymR->getSymbol());
-          if (!SymRV) {
-              const SymbolDerived *SD = dyn_cast<SymbolDerived>(SymR->getSymbol());
-              if (SD) {
-                  return SD->getParentSymbol();
-                  break;
-              }
-              break;
-          }
-          Region = SymRV->getRegion();
-          continue;
-      }
-      const SubRegion *SR = Region->getAs<SubRegion>();
-      if (!SR)
-          break;
-      Region = SR->getSuperRegion();
     }
     return nullptr;
   }
@@ -628,11 +601,6 @@ bool GCChecker::isBundleOfGCValues(QualType QT) const {
     }, QT);
 }
 
-bool GCChecker::isTypeMapType(QualType QT) {
-  TagDecl *TD = QT->getUnqualifiedDesugaredType()->getAsTagDecl();
-  return TD && TD->getName().endswith_lower("jl_typemap_t");
-}
-
 bool GCChecker::isGCTrackedType(QualType QT) {
     return isJuliaType([](StringRef Name) {
       if (Name.endswith_lower("jl_value_t") ||
@@ -666,7 +634,8 @@ bool GCChecker::isGCTrackedType(QualType QT) {
           Name.endswith_lower("interpreter_state") ||
           Name.endswith_lower("jl_typeenv_t") ||
           Name.endswith_lower("jl_stenv_t") ||
-          Name.endswith_lower("jl_varbinding_t")
+          Name.endswith_lower("jl_varbinding_t") ||
+          Name.endswith_lower("set_world")
           ) {
           return true;
       }
@@ -796,18 +765,7 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext 
   }
   SymbolRef Sym = Call.getReturnValue().getAsSymbol();
   SValExplainer Ex(C.getASTContext());
-  if (isTypeMapType(QT)) {
-    QualType VoidPtr = C.getASTContext().getPointerType(C.getASTContext().VoidTy);
-    SVal S = C.getSValBuilder().conjureSymbolVal(Call.getOriginExpr(),
-      C.getLocationContext(), VoidPtr, C.blockCount());
-    auto &BasicVals = C.getSValBuilder().getBasicValueFactory();
-    llvm::ImmutableList<SVal> vals = BasicVals.getEmptySValList();
-    vals = BasicVals.prependSVal(S, vals);
-    Sym = S.getAsSymbol();
-    // This is probably technically horribly wrong, but tends to
-    // work ok in practice.
-    State = State->BindExpr(Call.getOriginExpr(), C.getLocationContext(), S);
-  } else if (!Sym) {
+  if (!Sym) {
     SVal S = C.getSValBuilder().conjureSymbolVal(Call.getOriginExpr(),
       C.getLocationContext(), QT, C.blockCount());
     State = State->BindExpr(Call.getOriginExpr(), C.getLocationContext(), S);
@@ -864,15 +822,6 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call, CheckerContext 
                         const ValueState *OldVState = getValStateForRegion(C.getASTContext(), State, Region);
                         if (OldVState)
                             NewVState = *OldVState;
-                        else {
-                            while (!OldVState && Region) {
-                              SymbolRef VSym = Helpers::walk_back_to_Sym(Region);
-                              OldVState = VSym ? State->get<GCValueMap>(VSym) : nullptr;
-                              Region = VSym ? VSym->getOriginRegion() : nullptr;
-                            }
-                            if (OldVState)
-                               NewVState = *OldVState;
-                        }
                         break;
                     }
                 }
@@ -908,28 +857,6 @@ SymbolRef GCChecker::getSymbolForResult(const Expr *Result, const ValueState *Ol
   auto ValLoc = C.getSVal(Result).getAs<Loc>();
   if (!ValLoc) {
       return nullptr;
-  }
-  TagDecl *TD = Result->getType()->getUnqualifiedDesugaredType()->getAsTagDecl();
-  if (TD && TD->getName().endswith_lower("jl_typemap_t")) {
-      RecordDecl *RD = Result->getType()->getAsRecordDecl();
-      FieldDecl *FD = nullptr;
-      for (auto *FD2 : RD->fields()) {
-          if (FD2->getName().endswith_lower("unknown")) {
-              FD = FD2;
-              break;
-          }
-      }
-      assert(FD);
-      ValLoc = State->getLValue(FD, C.getSVal(Result)).getAs<Loc>();
-      SVal Loaded = State->getSVal(*ValLoc);
-      if (!Loaded.getAsSymbol() || !State->get<GCValueMap>(Loaded.getAsSymbol())) {
-        QualType QT = C.getASTContext().getPointerType(C.getASTContext().VoidTy);
-        Loaded = C.getSValBuilder().conjureSymbolVal(Result, C.getLocationContext(), QT,
-                                              C.blockCount());
-        State = State->bindLoc(*ValLoc, Loaded, C.getLocationContext());
-        State->BindExpr(Result, C.getLocationContext(), Loaded);
-      }
-      return Loaded.getAsSymbol();
   }
   SVal Loaded = State->getSVal(*ValLoc);
   SValExplainer Ex(C.getASTContext());
@@ -1021,11 +948,6 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent, bool P
         return;
       }
     }
-    while (!OldValS && Region) {
-      OldSym = Helpers::walk_back_to_Sym(Region);
-      OldValS = OldSym ? State->get<GCValueMap>(OldSym) : nullptr;
-      Region = OldSym ? OldSym->getOriginRegion() : nullptr;
-    }
     // NewSym might already have a better root
     const ValueState *NewValS = State->get<GCValueMap>(NewSym);
     if (NewValS && NewValS->isRooted()) {
@@ -1085,30 +1007,6 @@ void GCChecker::checkPostStmt(const MemberExpr *ME, CheckerContext &C) const
       }
     }
     clang::Expr *Base = ME->getBase();
-    TagDecl *TD = Base->getType()->getUnqualifiedDesugaredType()->getAsTagDecl();
-    if (TD && TD->getName().endswith_lower("jl_typemap_t")) {
-        //llvm::dbgs() << "Ok, what do we do here?\n";
-        RecordDecl *RD = Base->getType()->getAsRecordDecl();
-        assert(RD);
-        FieldDecl *FD = nullptr;
-        for (auto *FD2 : RD->fields()) {
-            if (FD2->getName().endswith_lower("unknown")) {
-                FD = FD2;
-                break;
-            }
-        }
-        assert(FD);
-        if (FD->getType() == ME->getType())
-            return;
-        SVal Field = State->getLValue(FD, C.getSVal(Base));
-        SVal Casted = C.getSValBuilder().evalCast(
-            Field,
-            ME->getType(),
-            FD->getType()
-        );
-        C.addTransition(State->BindExpr(ME, C.getLocationContext(), Field));
-        return;
-    }
     checkDerivingExpr(ME, Base, true, C);
 }
 
